@@ -3,6 +3,7 @@
 # --- 1. Global Setup ---
 INSTALL_DIR="/opt/g2serve"
 AGENT_PATH="$INSTALL_DIR/g2agent.sh"
+FIXED_WEBHOOK_URL="https://nscl.tailc52c94.ts.net/webhook/ps2"
 
 # Ensure script is run as root
 if [[ $EUID -ne 0 ]]; then
@@ -22,7 +23,6 @@ install_agent() {
     read -p "Enter Organization ID: " USER_ORG_ID
     read -p "Enter License Key: " USER_LKEY
     read -p "Enter Server ID (e.g., G2MON): " USER_SID
-    read -p "Enter Webhook URL: " USER_URL
 
     # Interactive Target Loop
     TARGETS_STRING=""
@@ -47,7 +47,7 @@ install_agent() {
 ORG_ID="$USER_ORG_ID"
 LICENSE_KEY="$USER_LKEY"
 SERVER_ID="$USER_SID"
-N8N_WEBHOOK_URL="$USER_URL"
+N8N_WEBHOOK_URL="$FIXED_WEBHOOK_URL"
 
 TARGETS=( $TARGETS_STRING 
 )
@@ -138,34 +138,25 @@ EOF
     (crontab -l 2>/dev/null | grep -v "$AGENT_PATH"; echo "$CRON_JOB") | crontab -
 
     echo "--- Installation Complete ---"
-    echo "Agent located at: $AGENT_PATH"
+    echo "Agent successfully installed at: $AGENT_PATH"
+    echo "Sending data to: $FIXED_WEBHOOK_URL"
 }
 
 # --- 3. Uninstallation Logic ---
 uninstall_agent() {
     echo "--- Starting G2 Monitor Agent Uninstallation ---"
-    
-    # Remove Cron
-    echo "Removing cron job..."
     (crontab -l 2>/dev/null | grep -v "$AGENT_PATH") | crontab -
-
-    # Remove Files
     if [ -d "$INSTALL_DIR" ]; then
-        echo "Deleting $INSTALL_DIR..."
         rm -rf "$INSTALL_DIR"
+        echo "Agent files deleted."
     fi
-
     echo "--- Uninstallation Complete ---"
 }
 
 # --- 4. Main Menu ---
 case "$1" in
-    install)
-        install_agent
-        ;;
-    uninstall)
-        uninstall_agent
-        ;;
+    install) install_agent ;;
+    uninstall) uninstall_agent ;;
     *)
         echo "Usage: sudo $0 {install|uninstall}"
         exit 1
