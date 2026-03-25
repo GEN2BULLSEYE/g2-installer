@@ -1,15 +1,19 @@
 #!/bin/bash
 
 # --- 1. Global Setup ---
-INSTALL_DIR="/opt/g2serve"
-[[ "$OSTYPE" == "darwin"* ]] && INSTALL_DIR="$HOME/.g2serve"
+# Use different paths for Mac vs Linux to avoid Permission/SIP issues
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    INSTALL_DIR="$HOME/.g2serve"
+else
+    INSTALL_DIR="/opt/g2serve"
+fi
+
 AGENT_PATH="$INSTALL_DIR/g2agent.sh"
-CONFIG_FILE="$INSTALL_DIR/agent.env" # Store variables here for easy management
+CONFIG_FILE="$INSTALL_DIR/agent.env"
 FIXED_WEBHOOK_URL="https://nscl.tailc52c94.ts.net/webhook/ps2"
 
 # --- 2. Helper Functions ---
 
-# Detect OS and set package manager
 get_os() {
     if [[ "$OSTYPE" == "darwin"* ]]; then
         echo "macos"
@@ -26,16 +30,23 @@ install_dependencies() {
     OS_TYPE=$(get_os)
     echo "Installing dependencies for $OS_TYPE..."
     case $OS_TYPE in
-        "debian") apt-get update -y && apt-get install -y jq curl httping iputils-ping ;;
-        "redhat") dnf install -y jq curl httping iputils-ping || yum install -y jq curl httping ;;
+        "debian")
+            sudo apt-get update -y && sudo apt-get install -y jq curl httping iputils-ping
+            ;;
+        "redhat")
+            sudo dnf install -y jq curl httping iputils-ping || sudo yum install -y jq curl httping
+            ;;
         "macos") 
-            if ! command -v brew >/dev/null 2>&1; then echo "Install Homebrew first: https://brew.sh"; exit 1; fi
+            if ! command -v brew >/dev/null 2>&1; then 
+                echo "Error: Homebrew not found. Please install it first at https://brew.sh"
+                exit 1 
+            fi
+            # Running brew WITHOUT sudo as required by macOS
             brew install jq curl httping 
             ;;
     esac
 }
 
-# This generates the actual worker script
 write_agent_script() {
     cat << 'EOF' > "$AGENT_PATH"
 #!/bin/bash
@@ -55,7 +66,7 @@ process_target() {
     TARGET=$(echo "${entry#*|}" | xargs)
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        PING_RESULT=$(ping -c 3 -W 2000 "$TARGET" 2>/dev/null)
+        PING_RESULT=$(ping -c 3 -t 2 "$TARGET" 2>/dev/null)
     else
         PING_RESULT=$(ping -c 3 -W 2 "$TARGET" 2>/dev/null)
     fi
@@ -97,54 +108,54 @@ EOF
 }
 
 save_config() {
-    {
-        echo "ORG_ID=\"$ORG_ID\""
-        echo "LICENSE_KEY=\"$LICENSE_KEY\""
-        echo "SERVER_ID=\"$SERVER_ID\""
-        echo "N8N_WEBHOOK_URL=\"$FIXED_WEBHOOK_URL\""
-        declare -p TARGETS
-    } > "$CONFIG_FILE"
+    # On Linux, we need sudo to write to /opt
+    if [[ "$(get_os)" != "macos" ]]; then
+        sudo bash -c "cat << EOF > $CONFIG_FILE
+ORG_ID=\"$ORG_ID\"
+LICENSE_KEY=\"$LICENSE_KEY\"
+SERVER_ID=\"$SERVER_ID\"
+N8N_WEBHOOK_URL=\"$FIXED_WEBHOOK_URL\"
+$(declare -p TARGETS)
+EOF"
+    else
+        {
+            echo "ORG_ID=\"$ORG_ID\""
+            echo "LICENSE_KEY=\"$LICENSE_KEY\""
+            echo "SERVER_ID=\"$SERVER_ID\""
+            echo "N8N_WEBHOOK_URL=\"$FIXED_WEBHOOK_URL\""
+            declare -p TARGETS
+        } > "$CONFIG_FILE"
+    fi
 }
 
 # --- 3. Management Logic ---
 
 manage_monitors() {
     source "$CONFIG_FILE"
-    echo -e "\n--- Current Monitors ---"
-    for i in "${!TARGETS[@]}"; do
-        echo "$((i+1))) ${TARGETS[$i]}"
+    while true; do
+        echo -e "\n--- Current Monitors ---"
+        for i in "${!TARGETS[@]}"; do echo "$((i+1))) ${TARGETS[$i]}"; done
+        echo "------------------------"
+        echo "1) Add Monitor"
+        echo "2) Remove Monitor"
+        echo "3) Back"
+        read -p "Selection: " m_opt
+        case $m_opt in
+            1) read -p "Name: " n; read -p "Target: " t; TARGETS+=("$n | $t"); save_config ;;
+            2) read -p "Number to remove: " r; idx=$((r-1)); unset 'TARGETS[$idx]'; TARGETS=("${TARGETS[@]}"); save_config ;;
+            3) break ;;
+        esac
     done
-    echo "------------------------"
-    echo "1) Add Monitor"
-    echo "2) Remove Monitor"
-    echo "3) Back"
-    read -p "Selection: " m_opt
-    
-    case $m_opt in
-        1)
-            read -p "  Name: " n_mon
-            read -p "  Target: " t_mon
-            TARGETS+=("$n_mon | $t_mon")
-            save_config && echo "Added."
-            ;;
-        2)
-            read -p "  Enter number to remove: " r_idx
-            idx=$((r_idx-1))
-            if [[ ${TARGETS[$idx]} ]]; then
-                unset 'TARGETS[$idx]'
-                TARGETS=("${TARGETS[@]}") # Re-index array
-                save_config && echo "Removed."
-            else
-                echo "Invalid index."
-            fi
-            ;;
-    esac
 }
 
 uninstall_gen2() {
     echo "Uninstalling GEN2..."
     (crontab -l 2>/dev/null | grep -v "g2agent.sh") | crontab -
-    rm -rf "$INSTALL_DIR"
+    if [[ "$(get_os)" == "macos" ]]; then
+        rm -rf "$INSTALL_DIR"
+    else
+        sudo rm -rf "$INSTALL_DIR"
+    fi
     echo "GEN2 completely removed."
     exit 0
 }
@@ -154,14 +165,12 @@ uninstall_gen2() {
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
     echo "--- GEN2 Management Console ---"
-    echo "Status: INSTALLED"
     echo "1) Manage Monitors"
     echo "2) Change Organization ID (Current: $ORG_ID)"
     echo "3) Change License Key"
     echo "4) Uninstall GEN2"
     echo "5) Exit"
     read -p "Choose an option: " choice
-
     case $choice in
         1) manage_monitors ;;
         2) read -p "New Org ID: " ORG_ID; save_config ;;
@@ -170,27 +179,30 @@ if [ -f "$CONFIG_FILE" ]; then
         *) exit 0 ;;
     esac
 else
-    # Fresh Installation
     echo "--- GEN2 Agent Deployment ---"
     install_dependencies
-    mkdir -p "$INSTALL_DIR"
+    
+    # Create directory (with sudo for Linux)
+    if [[ "$(get_os)" != "macos" ]]; then
+        sudo mkdir -p "$INSTALL_DIR"
+        sudo chown $USER "$INSTALL_DIR" 2>/dev/null || true
+    else
+        mkdir -p "$INSTALL_DIR"
+    fi
+
     read -p "Organization ID: " ORG_ID
     read -p "License Key: " LICENSE_KEY
     read -p "Server ID: " SERVER_ID
     TARGETS=()
-    
-    # Initial Monitor
-    read -p "Add first monitor? (y/n): " init_m
-    if [[ "$init_m" == "y" ]]; then
-        read -p "  Name: " n_mon
-        read -p "  Target: " t_mon
-        TARGETS+=("$n_mon | $t_mon")
+    read -p "Add first monitor? (y/n): " im
+    if [[ "$im" == "y" ]]; then
+        read -p "Name: " n; read -p "Target: " t; TARGETS+=("$n | $t")
     fi
 
     save_config
     write_agent_script
     
-    # Cron setup
+    # Cron setup (works for both Mac/Linux)
     CRON_JOB="* * * * * $AGENT_PATH > /dev/null 2>&1"
     (crontab -l 2>/dev/null | grep -v "g2agent.sh"; echo "$CRON_JOB") | crontab -
     echo "Installation Complete!"
