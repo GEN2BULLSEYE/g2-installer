@@ -4,9 +4,8 @@
 if [[ "$OSTYPE" == "darwin"* ]]; then
     OS_TYPE="macos"
     INSTALL_DIR="$HOME/.g2serve"
-    # Ensure standard user owns the directory
+    # Auto-repair permissions if root accidentally owns the folder
     if [ -d "$INSTALL_DIR" ] && [ "$(stat -f '%u' "$INSTALL_DIR")" -eq 0 ]; then
-        echo "Repairing directory permissions..."
         sudo chown -R $(whoami) "$INSTALL_DIR"
     fi
 else
@@ -38,16 +37,22 @@ write_agent_script() {
     mkdir -p "$INSTALL_DIR"
     cat << 'EOF' > "$AGENT_PATH"
 #!/bin/bash
-# Ensure Homebrew and System paths are available to Cron
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-
 source "$(dirname "$0")/agent.env"
 
 # Network Discovery
 if [[ "$OSTYPE" == "darwin"* ]]; then
     LOCAL_IP=$(ipconfig getifaddr $(route get default | grep interface | awk '{print $2}'))
+    # Improved macOS WiFi Detection
+    WIFI_SSID=$(networksetup -getairportnetwork en0 | cut -d ":" -f 2- | sed 's/^ //')
+    [[ "$WIFI_SSID" == *"Error"* ]] && WIFI_SSID="N/A"
 else
     LOCAL_IP=$(hostname -I | awk '{print $1}')
+    if command -v nmcli >/dev/null 2>&1; then
+        WIFI_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+    else
+        WIFI_SSID="N/A"
+    fi
 fi
 WAN_IP=$(curl -s https://ifconfig.me)
 
@@ -56,9 +61,7 @@ process_target() {
     NAME=$(echo "${entry%%|*}" | xargs)
     TARGET=$(echo "${entry#*|}" | xargs)
 
-    # Ping Logic (macOS vs Linux)
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # Mac Summary: round-trip min/avg/max/stddev = 10.1/12.4/15.2/2.1 ms
         PING_RESULT=$(ping -c 3 -t 2 "$TARGET" 2>/dev/null)
         PING_LATENCY=$(echo "$PING_RESULT" | tail -1 | awk -F'/' '{print $5}' | tr -dc '0-9.')
     else
@@ -68,7 +71,6 @@ process_target() {
 
     PING_STATUS=$([[ -z "$PING_LATENCY" || "$PING_LATENCY" == "0" ]] && echo "down" || echo "up")
 
-    # HTTP Logic
     if [[ "$TARGET" == http* ]]; then
         HTTP_RESULT=$(httping -G -g "$TARGET" -c 3 -t 3 2>/dev/null)
         HTTP_LATENCY=$(echo "$HTTP_RESULT" | grep "avg" | awk -F'/' '{print $5}' | tr -dc '0-9.')
@@ -77,14 +79,13 @@ process_target() {
         HTTP_STATUS="n/a"; HTTP_LATENCY=0
     fi
 
-    # JSON Payload
     PAYLOAD=$(jq -n \
       --arg oid "$ORG_ID" --arg lkey "$LICENSE_KEY" --arg sid "$SERVER_ID" \
-      --arg lip "$LOCAL_IP" --arg wip "$WAN_IP" --arg mon "$NAME" \
-      --arg tar "$TARGET" --arg p_sta "$PING_STATUS" --argjson p_lat "${PING_LATENCY:-0}" \
-      --arg h_sta "$HTTP_STATUS" --argjson h_lat "${HTTP_LATENCY:-0}" \
-      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{org_id: $oid, license_key: $lkey, server_id: $sid, local_ip: $lip, wan_ip: $wip, monitor: $mon, target: $tar, ping_status: $p_sta, ping_latency_ms: $p_lat, http_status: $h_sta, http_latency_ms: $h_lat, timestamp: $ts}')
+      --arg lip "$LOCAL_IP" --arg wip "$WAN_IP" --arg ssid "$WIFI_SSID" \
+      --arg mon "$NAME" --arg tar "$TARGET" --arg p_sta "$PING_STATUS" \
+      --argjson p_lat "${PING_LATENCY:-0}" --arg h_sta "$HTTP_STATUS" \
+      --argjson h_lat "${HTTP_LATENCY:-0}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{org_id: $oid, license_key: $lkey, server_id: $sid, local_ip: $lip, wan_ip: $wip, wifi_ssid: $ssid, monitor: $mon, target: $tar, ping_status: $p_sta, ping_latency_ms: $p_lat, http_status: $h_sta, http_latency_ms: $h_lat, timestamp: $ts}')
 
     curl -X POST "$N8N_WEBHOOK_URL" -H "Content-Type: application/json" -d "$PAYLOAD" -s -o /dev/null
 }
@@ -97,7 +98,6 @@ EOF
     chmod +x "$AGENT_PATH"
 }
 
-# --- 4. Configuration Manager ---
 save_config() {
     {
         echo "ORG_ID=\"$ORG_ID\""
@@ -108,33 +108,59 @@ save_config() {
     } > "$CONFIG_FILE"
 }
 
-# --- 5. Main Control Loop ---
+# --- 4. Main Menu Logic ---
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
-    echo "--- GEN2 Management (macOS Ready) ---"
+    echo "--- GEN2 Management Console ---"
     echo "1) Manage Monitors"
-    echo "2) Change Org/License"
+    echo "2) Change Credentials"
     echo "3) Uninstall GEN2"
     echo "4) Exit"
-    read -p "Select: " opt
-    case $opt in
+    read -p "Select: " choice
+    case $choice in
         1) 
-           echo "Current: ${TARGETS[@]}"
-           read -p "Add new? (name|url): " nt && TARGETS+=("$nt") && save_config && echo "Added." ;;
-        2) read -p "New Org: " ORG_ID; read -p "New Key: " LICENSE_KEY; save_config ;;
-        3) (crontab -l 2>/dev/null | grep -v "g2agent.sh") | crontab - && rm -rf "$INSTALL_DIR" && echo "Removed." ;;
+            while true; do
+                echo -e "\n--- Current Monitors ---"
+                for i in "${!TARGETS[@]}"; do echo "$((i+1))) ${TARGETS[$i]}"; done
+                echo "------------------------"
+                echo "1) Add Monitor"
+                echo "2) Remove Monitor"
+                echo "3) Back"
+                read -p "Selection: " m_opt
+                if [[ "$m_opt" == "1" ]]; then
+                    read -p "  Monitor Name: " n && read -p "  Target (URL/IP): " t
+                    TARGETS+=("$n | $t") && save_config && echo "Added."
+                elif [[ "$m_opt" == "2" ]]; then
+                    read -p "  Enter # to remove: " r && idx=$((r-1))
+                    unset 'TARGETS[$idx]' && TARGETS=("${TARGETS[@]}") && save_config && echo "Removed."
+                else break; fi
+            done
+            ;;
+        2) read -p "New Org ID: " ORG_ID; read -p "New License: " LICENSE_KEY; save_config ;;
+        3) (crontab -l 2>/dev/null | grep -v "g2agent.sh") | crontab - && rm -rf "$INSTALL_DIR" && echo "Uninstalled." ;;
         *) exit 0 ;;
     esac
 else
-    # First Time Setup
+    # Fresh Installation
     install_dependencies
-    read -p "Org ID: " ORG_ID
-    read -p "License: " LICENSE_KEY
+    mkdir -p "$INSTALL_DIR"
+    read -p "Organization ID: " ORG_ID
+    read -p "License Key: " LICENSE_KEY
     read -p "Server ID: " SERVER_ID
+    
     TARGETS=()
-    read -p "First Monitor (Name | Target): " fm && TARGETS+=("$fm")
+    while true; do
+        echo -e "\n--- Add a Monitor ---"
+        read -p "  Monitor Name (e.g., Google): " m_name
+        read -p "  Target (URL or IP): " m_target
+        TARGETS+=("$m_name | $m_target")
+        
+        read -p "Add another monitor? (y/n): " confirm
+        [[ "$confirm" != "y" ]] && break
+    done
+
     save_config
     write_agent_script
     (crontab -l 2>/dev/null | grep -v "g2agent.sh"; echo "* * * * * $AGENT_PATH > /dev/null 2>&1") | crontab -
-    echo "Installation Complete! Status should be UP within 1 minute."
+    echo "Installation Complete!"
 fi
