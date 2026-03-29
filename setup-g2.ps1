@@ -72,27 +72,27 @@ if ($Mode -eq "Monitor") {
         $Name   = $parts[0].Trim()
         $Target = $parts[1].Trim()
         if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Target)) { continue }
-        $Host   = $Target -replace 'https?://', '' -replace '/.*', ''
+        $TargetHost = $Target -replace 'https?://', '' -replace '/.*', ''
 
         # Ping check — use .NET Ping directly (more reliable than Test-Connection under SYSTEM)
         $PingSt  = "down"
         $PingLat = 0
-        try {
-            $pinger = New-Object System.Net.NetworkInformation.Ping
-            $total  = 0
-            $count  = 0
-            1..2 | ForEach-Object {
-                $reply = $pinger.Send($Host, 2000)
+        $pinger = New-Object System.Net.NetworkInformation.Ping
+        $total  = 0
+        $count  = 0
+        foreach ($i in 1..2) {
+            try {
+                $reply = $pinger.Send($TargetHost, 2000)
                 if ($reply.Status -eq "Success") {
                     $total += $reply.RoundtripTime
                     $count++
                 }
-            }
-            if ($count -gt 0) {
-                $PingSt  = "up"
-                $PingLat = [Math]::Round($total / $count, 1)
-            }
-        } catch { <# ICMP blocked — leave as down #> }
+            } catch { <# ignore individual ping failure #> }
+        }
+        if ($count -gt 0) {
+            $PingSt  = "up"
+            $PingLat = [Math]::Round($total / $count, 1)
+        }
 
         # HTTP check (only for http/https targets)
         $HttpStatus = "n/a"
