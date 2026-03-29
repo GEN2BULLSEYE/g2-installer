@@ -40,64 +40,68 @@ $InitConfig = @{
 }
 $InitConfig | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
 
-# --- 4. Write the Agent Script (Fixed Escaping) ---
-$agentCode = @"
-`$Config = Get-Content "$CONFIG_FILE" | ConvertFrom-Json
-`$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { `$_.InterfaceAlias -notlike '*Loopback*' }).IPAddress[0]
-`$WanIP = (Invoke-RestMethod -Uri "https://ifconfig.me/ip").Trim()
-`$WifiSSID = (netsh wlan show interfaces | Select-String "SSID" | Select-Object -First 1).ToString().Split(":")[1].Trim()
-if (!`$WifiSSID) { `$WifiSSID = "N/A" }
+# --- 4. Write the Agent Script (Using Literal String) ---
+$agentCode = @'
+$Config = Get-Content "C:\ProgramData\g2serve\agent.json" | ConvertFrom-Json
+$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' }).IPAddress[0]
+$WanIP = (Invoke-RestMethod -Uri "https://ifconfig.me/ip").Trim()
+$WifiSSID = (netsh wlan show interfaces | Select-String "SSID" | Select-Object -First 1).ToString().Split(":")[1].Trim()
+if (!$WifiSSID) { $WifiSSID = "N/A" }
 
-foreach (`$entry in `$Config.TARGETS) {
+foreach ($entry in $Config.TARGETS) {
     Start-Job -ScriptBlock {
-        param(`$entry, `$Config, `$LocalIP, `$WanIP, `$WifiSSID, `$Webhook)
-        `$parts = `$entry -split '\|'
-        `$Name = `$parts[0].Trim(); `$Target = `$parts[1].Trim()
-        `$ping = Test-Connection -ComputerName (`$Target -replace 'https?://', '') -Count 2 -ErrorAction SilentlyContinue
-        `$PingLat = if (`$ping) { `$ping.ResponseTime.Average } else { 0 }
-        `$HttpStatus = "n/a"; `$HttpLat = 0
-        if (`$Target -like "http*") {
+        param($entry, $Config, $LocalIP, $WanIP, $WifiSSID)
+        $Webhook = "https://nscl.tailc52c94.ts.net/webhook/ps2"
+        $parts = $entry -split '\|'
+        $Name = $parts[0].Trim(); $Target = $parts[1].Trim()
+        $ping = Test-Connection -ComputerName ($Target -replace 'https?://', '') -Count 2 -ErrorAction SilentlyContinue
+        $PingLat = if ($ping) { $ping.ResponseTime.Average } else { 0 }
+        $HttpStatus = "n/a"; $HttpLat = 0
+        if ($Target -like "http*") {
             try {
-                `$s = Get-Date; `$res = Invoke-WebRequest -Uri `$Target -UseBasicParsing -TimeoutSec 3
-                `$HttpLat = ((Get-Date) - `$s).TotalMilliseconds; `$HttpStatus = "up"
-            } catch { `$HttpStatus = "down" }
+                $s = Get-Date; $res = Invoke-WebRequest -Uri $Target -UseBasicParsing -TimeoutSec 3
+                $HttpLat = ((Get-Date) - $s).TotalMilliseconds; $HttpStatus = "up"
+            } catch { $HttpStatus = "down" }
         }
-        `$Payload = @{
-            org_id = `$Config.ORG_ID; license_key = `$Config.LICENSE_KEY; server_id = `$Config.SERVER_ID
-            local_ip = `$LocalIP; wan_ip = `$WanIP; wifi_ssid = `$WifiSSID
-            monitor = `$Name; target = `$Target; ping_status = if(`$ping){"up"}else{"down"}
-            ping_latency_ms = `$PingLat; http_status = `$HttpStatus; http_latency_ms = `$HttpLat
+        $Payload = @{
+            org_id = $Config.ORG_ID; license_key = $Config.LICENSE_KEY; server_id = $Config.SERVER_ID
+            local_ip = $LocalIP; wan_ip = $WanIP; wifi_ssid = $WifiSSID
+            monitor = $Name; target = $Target; ping_status = if($ping){"up"}else{"down"}
+            ping_latency_ms = $PingLat; http_status = $HttpStatus; http_latency_ms = $HttpLat
             timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         }
-        Invoke-RestMethod -Uri `$Webhook -Method Post -ContentType "application/json" -Body (ConvertTo-Json `$Payload)
-    } -ArgumentList `$entry, `$Config, `$LocalIP, `$WanIP, `$WifiSSID, "$FIXED_WEBHOOK_URL"
+        Invoke-RestMethod -Uri $Webhook -Method Post -ContentType "application/json" -Body (ConvertTo-Json $Payload)
+    } -ArgumentList $entry, $Config, $LocalIP, $WanIP, $WifiSSID
 }
-"@
+'@
 $agentCode | Out-File $AGENT_PATH -Encoding utf8
 
-# --- 5. Write the Pull Agent (Fixed Escaping) ---
-$pullCode = @"
-if (!(Test-Path "$CONFIG_FILE")) { exit 1 }
-`$Config = Get-Content "$CONFIG_FILE" | ConvertFrom-Json
+# --- 5. Write the Pull Agent (Using Literal String) ---
+# We hardcode the base URL here to avoid variable injection issues during setup
+$pullCode = @'
+$CONFIG_FILE = "C:\ProgramData\g2serve\agent.json"
+$GEN2_BASE_URL = "https://gen2bullseye.com"
+if (!(Test-Path $CONFIG_FILE)) { exit 1 }
+$Config = Get-Content $CONFIG_FILE | ConvertFrom-Json
 try {
-    `$uri = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$(`$($)Config.LICENSE_KEY)&org_id=$(`$($)Config.ORG_ID)"
-    `$jobs = Invoke-RestMethod -Uri `$uri -Method Get
+    $uri = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
+    $jobs = Invoke-RestMethod -Uri $uri -Method Get
 } catch { exit 1 }
-if (`$null -eq `$jobs) { exit 0 }
-foreach (`$job in `$jobs) {
-    `$Current = [System.Collections.Generic.List[string]]::new(`$Config.TARGETS)
-    if (`$job.action -eq "add") {
-        `$entry = "$(`$($)job.monitor_name) | $(`$($)job.target)"
-        if (!(`$Current -contains `$entry)) { `$Current.Add(`$entry) }
-    } elseif (`$job.action -eq "remove") {
-        `$Current.RemoveAll({ param(`$t) `$t.Split('|')[0].Trim() -eq `$job.monitor_name })
+if ($null -eq $jobs) { exit 0 }
+foreach ($job in $jobs) {
+    $Current = [System.Collections.Generic.List[string]]::new($Config.TARGETS)
+    if ($job.action -eq "add") {
+        $entry = "$($job.monitor_name) | $($job.target)"
+        if (!($Current -contains $entry)) { $Current.Add($entry) }
+    } elseif ($job.action -eq "remove") {
+        $Current.RemoveAll({ param($t) $t.Split('|')[0].Trim() -eq $job.monitor_name })
     }
-    `$Config.TARGETS = `$Current.ToArray()
-    `$Config | ConvertTo-Json | Out-File "$CONFIG_FILE" -Encoding utf8
-    `$ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$(`$($)job.id)/ack?license_key=$(`$($)Config.LICENSE_KEY)&org_id=$(`$($)Config.ORG_ID)"
-    Invoke-WebRequest -Uri `$ackUri -Method Post
+    $Config.TARGETS = $Current.ToArray()
+    $Config | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+    $ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$($job.id)/ack?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
+    Invoke-WebRequest -Uri $ackUri -Method Post
 }
-"@
+'@
 $pullCode | Out-File $PULL_PATH -Encoding utf8
 
 # --- 6. Task Registration ---
