@@ -74,10 +74,25 @@ if ($Mode -eq "Monitor") {
         if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Target)) { continue }
         $Host   = $Target -replace 'https?://', '' -replace '/.*', ''
 
-        # Ping check
-        $ping    = Test-Connection -ComputerName $Host -Count 2 -ErrorAction SilentlyContinue
-        $PingSt  = if ($ping) { "up" } else { "down" }
-        $PingLat = if ($ping) { ($ping | Measure-Object ResponseTime -Average).Average } else { 0 }
+        # Ping check — use .NET Ping directly (more reliable than Test-Connection under SYSTEM)
+        $PingSt  = "down"
+        $PingLat = 0
+        try {
+            $pinger = New-Object System.Net.NetworkInformation.Ping
+            $total  = 0
+            $count  = 0
+            1..2 | ForEach-Object {
+                $reply = $pinger.Send($Host, 2000)
+                if ($reply.Status -eq "Success") {
+                    $total += $reply.RoundtripTime
+                    $count++
+                }
+            }
+            if ($count -gt 0) {
+                $PingSt  = "up"
+                $PingLat = [Math]::Round($total / $count, 1)
+            }
+        } catch { <# ICMP blocked — leave as down #> }
 
         # HTTP check (only for http/https targets)
         $HttpStatus = "n/a"
