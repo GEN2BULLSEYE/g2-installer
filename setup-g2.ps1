@@ -16,24 +16,15 @@ if ($TaskMonitor -or $TaskPull -or (Test-Path $INSTALL_DIR)) {
     
     if ($confirm -eq 'y') {
         Write-Host "Removing existing tasks and files..." -ForegroundColor Cyan
-        # Remove Tasks
         Unregister-ScheduledTask -TaskName "G2_Monitor_Agent" -Confirm:$false -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName "G2_Pull_Agent" -Confirm:$false -ErrorAction SilentlyContinue
-        
-        # Stop any running jobs from the agent
-        Get-Job | Where-Object { $_.Name -like "Job*" } | Stop-Job -ErrorAction SilentlyContinue
-        
-        # Remove Files
-        if (Test-Path $INSTALL_DIR) {
-            Remove-Item -Recurse -Force $INSTALL_DIR
-        }
+        Get-Job | Stop-Job -ErrorAction SilentlyContinue
+        if (Test-Path $INSTALL_DIR) { Remove-Item -Recurse -Force $INSTALL_DIR }
         Write-Host "Cleanup complete.`n" -ForegroundColor Green
-    } else {
-        Write-Host "Proceeding with installation (Note: This may overwrite existing configs)." -ForegroundColor Gray
     }
 }
 
-# --- 3. Fresh Installation Starts Here ---
+# --- 3. Fresh Installation ---
 if (!(Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force }
 
 Write-Host "--- GEN2 Windows Ground Probe Setup ---" -ForegroundColor Cyan
@@ -41,7 +32,6 @@ $OrgId    = Read-Host "Organization ID"
 $License  = Read-Host "License Key"
 $ServerId = Read-Host "Server ID (Friendly Name)"
 
-# Save Initial Config
 $InitConfig = @{
     ORG_ID = $OrgId
     LICENSE_KEY = $License
@@ -50,7 +40,7 @@ $InitConfig = @{
 }
 $InitConfig | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
 
-# --- 4. Write the Agent Scripts (Same logic as before) ---
+# --- 4. Write the Agent Script (Fixed Escaping) ---
 $agentCode = @"
 `$Config = Get-Content "$CONFIG_FILE" | ConvertFrom-Json
 `$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { `$_.InterfaceAlias -notlike '*Loopback*' }).IPAddress[0]
@@ -85,32 +75,33 @@ foreach (`$entry in `$Config.TARGETS) {
 "@
 $agentCode | Out-File $AGENT_PATH -Encoding utf8
 
+# --- 5. Write the Pull Agent (Fixed Escaping) ---
 $pullCode = @"
 if (!(Test-Path "$CONFIG_FILE")) { exit 1 }
 `$Config = Get-Content "$CONFIG_FILE" | ConvertFrom-Json
 try {
-    `$uri = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$(`$Config.LICENSE_KEY)&org_id=$(`$Config.ORG_ID)"
+    `$uri = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$(`$($)Config.LICENSE_KEY)&org_id=$(`$($)Config.ORG_ID)"
     `$jobs = Invoke-RestMethod -Uri `$uri -Method Get
 } catch { exit 1 }
 if (`$null -eq `$jobs) { exit 0 }
 foreach (`$job in `$jobs) {
     `$Current = [System.Collections.Generic.List[string]]::new(`$Config.TARGETS)
     if (`$job.action -eq "add") {
-        `$entry = "$(`$job.monitor_name) | $(`$job.target)"
+        `$entry = "$(`$($)job.monitor_name) | $(`$($)job.target)"
         if (!(`$Current -contains `$entry)) { `$Current.Add(`$entry) }
     } elseif (`$job.action -eq "remove") {
         `$Current.RemoveAll({ param(`$t) `$t.Split('|')[0].Trim() -eq `$job.monitor_name })
     }
     `$Config.TARGETS = `$Current.ToArray()
     `$Config | ConvertTo-Json | Out-File "$CONFIG_FILE" -Encoding utf8
-    Invoke-WebRequest -Uri "$GEN2_BASE_URL/api/groundprobe/jobs/$(`$job.id)/ack?license_key=$(`$Config.LICENSE_KEY)&org_id=$(`$Config.ORG_ID)" -Method Post
+    `$ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$(`$($)job.id)/ack?license_key=$(`$($)Config.LICENSE_KEY)&org_id=$(`$($)Config.ORG_ID)"
+    Invoke-WebRequest -Uri `$ackUri -Method Post
 }
 "@
 $pullCode | Out-File $PULL_PATH -Encoding utf8
 
-# --- 5. Final Task Registration ---
+# --- 6. Task Registration ---
 Write-Host "Registering Scheduled Tasks..." -ForegroundColor Yellow
-
 $ActionMonitor = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -File `"$AGENT_PATH`""
 $TriggerMonitor = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName "G2_Monitor_Agent" -Action $ActionMonitor -Trigger $TriggerMonitor -User "System" -Force
@@ -120,4 +111,3 @@ $TriggerPull = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval
 Register-ScheduledTask -TaskName "G2_Pull_Agent" -Action $ActionPull -Trigger $TriggerPull -User "System" -Force
 
 Write-Host "`nInstallation Complete!" -ForegroundColor Green
-Write-Host "The GEN2 Ground Probe is now running silently in the background."
