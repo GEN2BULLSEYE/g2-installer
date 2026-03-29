@@ -1,130 +1,278 @@
-# --- 1. Environment Setup ---
-$INSTALL_DIR = "$env:ProgramData\g2serve"
-$CONFIG_FILE = "$INSTALL_DIR\agent.json"
-$AGENT_PATH  = "$INSTALL_DIR\g2agent.ps1"
-$PULL_PATH   = "$INSTALL_DIR\pull-agent.ps1"
-$GEN2_BASE_URL = "https://gen2bullseye.com"
+<#
+.SYNOPSIS
+    GEN2 Windows Ground Probe — unified installer and agent script.
 
-# --- 2. Existing Installation Detection & Choice ---
-$TaskMonitor = Get-ScheduledTask -TaskName "G2_Monitor_Agent" -ErrorAction SilentlyContinue
-$TaskPull = Get-ScheduledTask -TaskName "G2_Pull_Agent" -ErrorAction SilentlyContinue
+.DESCRIPTION
+    Run without arguments to install (Setup mode).
+    Scheduled Tasks invoke this same script with -Mode Monitor or -Mode Pull.
+
+    To run directly from GitHub (recommended):
+        $u = "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/path/to/installer.ps1"
+        & ([scriptblock]::Create((irm $u))) -ScriptUrl $u
+
+.PARAMETER Mode
+    Setup   — (default) Installs, uninstalls, or reconfigures the agent.
+    Monitor — Runs one monitoring pass (called every minute by Scheduled Task).
+    Pull    — Runs one job-pull pass (called every 5 minutes by Scheduled Task).
+
+.PARAMETER ScriptUrl
+    Raw GitHub URL of this script. Required when running via irm/iex (no local file).
+    Not needed when running from a saved .ps1 file.
+
+.NOTES
+    Must be run as Administrator for Setup mode.
+    Monitor and Pull modes run as SYSTEM via Scheduled Tasks.
+#>
+param(
+    [ValidateSet("Setup", "Monitor", "Pull")]
+    [string]$Mode = "Setup",
+
+    [string]$ScriptUrl = ""
+)
+
+# ============================================================
+# SHARED CONSTANTS
+# ============================================================
+$INSTALL_DIR   = "$env:ProgramData\g2serve"
+$CONFIG_FILE   = "$INSTALL_DIR\agent.json"
+$AGENT_PATH    = "$INSTALL_DIR\g2agent.ps1"
+$GEN2_BASE_URL = "https://gen2bullseye.com"
+$WEBHOOK_URL   = "https://nscl.tailc52c94.ts.net/webhook/ps2"
+$TASK_MONITOR  = "G2_Monitor_Agent"
+$TASK_PULL     = "G2_Pull_Agent"
+
+# ============================================================
+# MODE: MONITOR — runs every 1 minute via Scheduled Task
+# ============================================================
+if ($Mode -eq "Monitor") {
+    if (!(Test-Path $CONFIG_FILE)) { exit 1 }
+    $Config = Get-Content $CONFIG_FILE -Raw | ConvertFrom-Json
+
+    # Collect network info once per run
+    try {
+        $LocalIP = (Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.InterfaceAlias -notlike '*Loopback*' } |
+            Select-Object -First 1).IPAddress
+    } catch { $LocalIP = "unknown" }
+
+    try {
+        $WanIP = (Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 5).Trim()
+    } catch { $WanIP = "unknown" }
+
+    try {
+        $WifiSSID = (netsh wlan show interfaces |
+            Select-String "^\s+SSID\s+:" |
+            Select-Object -First 1).ToString().Split(":")[1].Trim()
+    } catch { $WifiSSID = "N/A" }
+    if ([string]::IsNullOrWhiteSpace($WifiSSID)) { $WifiSSID = "N/A" }
+
+    foreach ($entry in $Config.TARGETS) {
+        $parts = $entry -split '\|'
+        if ($parts.Count -lt 2) { continue }
+        $Name   = $parts[0].Trim()
+        $Target = $parts[1].Trim()
+        if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Target)) { continue }
+        $Host   = $Target -replace 'https?://', '' -replace '/.*', ''
+
+        # Ping check
+        $ping    = Test-Connection -ComputerName $Host -Count 2 -ErrorAction SilentlyContinue
+        $PingSt  = if ($ping) { "up" } else { "down" }
+        $PingLat = if ($ping) { ($ping | Measure-Object ResponseTime -Average).Average } else { 0 }
+
+        # HTTP check (only for http/https targets)
+        $HttpStatus = "n/a"
+        $HttpLat    = 0
+        if ($Target -like "http*") {
+            try {
+                $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+                $res = Invoke-WebRequest -Uri $Target -UseBasicParsing -TimeoutSec 5
+                $sw.Stop()
+                $HttpLat    = [Math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+                $HttpStatus = "up"
+            } catch {
+                $HttpStatus = "down"
+            }
+        }
+
+        $Payload = @{
+            org_id          = $Config.ORG_ID
+            license_key     = $Config.LICENSE_KEY
+            server_id       = $Config.SERVER_ID
+            local_ip        = $LocalIP
+            wan_ip          = $WanIP
+            wifi_ssid       = $WifiSSID
+            monitor         = $Name
+            target          = $Target
+            ping_status     = $PingSt
+            ping_latency_ms = $PingLat
+            http_status     = $HttpStatus
+            http_latency_ms = $HttpLat
+            timestamp       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+
+        try {
+            Invoke-RestMethod -Uri $WEBHOOK_URL -Method Post `
+                -ContentType "application/json" `
+                -Body ($Payload | ConvertTo-Json -Compress)
+        } catch { <# non-fatal: network blip #> }
+    }
+    exit 0
+}
+
+# ============================================================
+# MODE: PULL — runs every 5 minutes via Scheduled Task
+# ============================================================
+if ($Mode -eq "Pull") {
+    if (!(Test-Path $CONFIG_FILE)) { exit 1 }
+    $Config = Get-Content $CONFIG_FILE -Raw | ConvertFrom-Json
+
+    try {
+        $uri  = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
+        $jobs = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
+    } catch { exit 1 }
+
+    if ($null -eq $jobs -or $jobs.Count -eq 0) { exit 0 }
+
+    $Current = [System.Collections.Generic.List[string]]::new()
+    if ($Config.TARGETS) { $Config.TARGETS | ForEach-Object { $Current.Add($_) } }
+
+    foreach ($job in $jobs) {
+        if ($job.action -eq "add") {
+            $entry = "$($job.monitor_name) | $($job.target)"
+            if (-not ($Current -contains $entry)) { $Current.Add($entry) }
+        } elseif ($job.action -eq "remove") {
+            $exactEntry = "$($job.monitor_name) | $($job.target)"
+            if ($Current -contains $exactEntry) {
+                $Current.Remove($exactEntry) | Out-Null
+            } else {
+                $toRemove = $Current | Where-Object { $_.Split('|')[0].Trim() -eq $job.monitor_name }
+                foreach ($r in @($toRemove)) { $Current.Remove($r) | Out-Null }
+            }
+        }
+
+        $Config.TARGETS = $Current.ToArray()
+        $Config | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+
+        try {
+            $ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$($job.id)/ack?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
+            Invoke-WebRequest -Uri $ackUri -Method Post -UseBasicParsing | Out-Null
+        } catch { <# non-fatal #> }
+    }
+    exit 0
+}
+
+# ============================================================
+# MODE: SETUP — interactive installer (default)
+# ============================================================
+
+# Detect existing installation
+$TaskMonitor = Get-ScheduledTask -TaskName $TASK_MONITOR -ErrorAction SilentlyContinue
+$TaskPull    = Get-ScheduledTask -TaskName $TASK_PULL    -ErrorAction SilentlyContinue
 
 if ($TaskMonitor -or $TaskPull -or (Test-Path $INSTALL_DIR)) {
+    Write-Host ""
     Write-Host "--- Existing GEN2 Installation Detected ---" -ForegroundColor Yellow
     Write-Host "Choose an option:"
-    Write-Host "y) Uninstall existing version and EXIT (Run again to reinstall)"
-    Write-Host "n) Continue with installation/overwrite without uninstalling"
-    Write-Host "q) Quit"
+    Write-Host "  y) Uninstall and EXIT  (run the script again to reinstall)"
+    Write-Host "  n) Overwrite / reconfigure without uninstalling"
+    Write-Host "  q) Quit"
     $choice = Read-Host "Selection"
-    
+
     if ($choice -eq 'y') {
         Write-Host "`nUninstalling GEN2..." -ForegroundColor Cyan
-        # Remove Tasks
-        Unregister-ScheduledTask -TaskName "G2_Monitor_Agent" -Confirm:$false -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName "G2_Pull_Agent" -Confirm:$false -ErrorAction SilentlyContinue
-        
-        # Stop background jobs
-        Get-Job | Stop-Job -ErrorAction SilentlyContinue
-        
-        # Remove Files
-        if (Test-Path $INSTALL_DIR) {
-            Remove-Item -Recurse -Force $INSTALL_DIR
-        }
-        Write-Host "Uninstalled successfully. Exiting script." -ForegroundColor Green
-        exit # This stops the script so the user can start fresh on next run
+        Unregister-ScheduledTask -TaskName $TASK_MONITOR -Confirm:$false -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TASK_PULL    -Confirm:$false -ErrorAction SilentlyContinue
+        if (Test-Path $INSTALL_DIR) { Remove-Item -Recurse -Force $INSTALL_DIR }
+        Write-Host "Uninstalled successfully. Run the script again to reinstall." -ForegroundColor Green
+        exit 0
     } elseif ($choice -eq 'q') {
-        exit
+        exit 0
     }
     Write-Host "Continuing with setup...`n" -ForegroundColor Gray
 }
 
-# --- 3. Fresh Installation (Only reached if no install exists or user chose 'n') ---
-if (!(Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force }
+# Create install directory
+if (!(Test-Path $INSTALL_DIR)) {
+    New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
+}
 
+# Collect credentials
+Write-Host ""
 Write-Host "--- GEN2 Windows Ground Probe Setup ---" -ForegroundColor Cyan
 $OrgId    = Read-Host "Organization ID"
 $License  = Read-Host "License Key"
-$ServerId = Read-Host "Server ID (Friendly Name)"
+$ServerId = Read-Host "Server ID (friendly name for this machine)"
 
-$InitConfig = @{
-    ORG_ID = $OrgId
+# Write config
+@{
+    ORG_ID      = $OrgId
     LICENSE_KEY = $License
-    SERVER_ID = $ServerId
-    TARGETS = @()
-}
-$InitConfig | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+    SERVER_ID   = $ServerId
+    TARGETS     = @()
+} | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
 
-# --- 4. Write the Agent Script ---
-$agentCode = @'
-$Config = Get-Content "C:\ProgramData\g2serve\agent.json" | ConvertFrom-Json
-$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' }).IPAddress[0]
-$WanIP = (Invoke-RestMethod -Uri "https://ifconfig.me/ip").Trim()
-$WifiSSID = (netsh wlan show interfaces | Select-String "SSID" | Select-Object -First 1).ToString().Split(":")[1].Trim()
-if (!$WifiSSID) { $WifiSSID = "N/A" }
+# Copy / download this script to the install directory so Scheduled Tasks can reference it
+$ScriptSource = $MyInvocation.MyCommand.Path
 
-foreach ($entry in $Config.TARGETS) {
-    Start-Job -ScriptBlock {
-        param($entry, $Config, $LocalIP, $WanIP, $WifiSSID)
-        $Webhook = "https://nscl.tailc52c94.ts.net/webhook/ps2"
-        $parts = $entry -split '\|'
-        $Name = $parts[0].Trim(); $Target = $parts[1].Trim()
-        $ping = Test-Connection -ComputerName ($Target -replace 'https?://', '') -Count 2 -ErrorAction SilentlyContinue
-        $PingLat = if ($ping) { $ping.ResponseTime.Average } else { 0 }
-        $HttpStatus = "n/a"; $HttpLat = 0
-        if ($Target -like "http*") {
-            try {
-                $s = Get-Date; $res = Invoke-WebRequest -Uri $Target -UseBasicParsing -TimeoutSec 3
-                $HttpLat = ((Get-Date) - $s).TotalMilliseconds; $HttpStatus = "up"
-            } catch { $HttpStatus = "down" }
-        }
-        $Payload = @{
-            org_id = $Config.ORG_ID; license_key = $Config.LICENSE_KEY; server_id = $Config.SERVER_ID
-            local_ip = $LocalIP; wan_ip = $WanIP; wifi_ssid = $WifiSSID
-            monitor = $Name; target = $Target; ping_status = if($ping){"up"}else{"down"}
-            ping_latency_ms = $PingLat; http_status = $HttpStatus; http_latency_ms = $HttpLat
-            timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        }
-        Invoke-RestMethod -Uri $Webhook -Method Post -ContentType "application/json" -Body (ConvertTo-Json $Payload)
-    } -ArgumentList $entry, $Config, $LocalIP, $WanIP, $WifiSSID
-}
-'@
-$agentCode | Out-File $AGENT_PATH -Encoding utf8
-
-# --- 5. Write the Pull Agent ---
-$pullCode = @'
-$CONFIG_FILE = "C:\ProgramData\g2serve\agent.json"
-$GEN2_BASE_URL = "https://gen2bullseye.com"
-if (!(Test-Path $CONFIG_FILE)) { exit 1 }
-$Config = Get-Content $CONFIG_FILE | ConvertFrom-Json
-try {
-    $uri = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
-    $jobs = Invoke-RestMethod -Uri $uri -Method Get
-} catch { exit 1 }
-if ($null -eq $jobs) { exit 0 }
-foreach ($job in $jobs) {
-    $Current = [System.Collections.Generic.List[string]]::new($Config.TARGETS)
-    if ($job.action -eq "add") {
-        $entry = "$($job.monitor_name) | $($job.target)"
-        if (!($Current -contains $entry)) { $Current.Add($entry) }
-    } elseif ($job.action -eq "remove") {
-        $Current.RemoveAll({ param($t) $t.Split('|')[0].Trim() -eq $job.monitor_name })
+if (-not [string]::IsNullOrEmpty($ScriptSource)) {
+    # Running from a saved file — just copy it
+    Copy-Item -Path $ScriptSource -Destination $AGENT_PATH -Force
+} elseif (-not [string]::IsNullOrEmpty($ScriptUrl)) {
+    # Running from memory (irm | iex / scriptblock) — download from GitHub
+    Write-Host "Downloading agent script from GitHub..." -ForegroundColor Cyan
+    try {
+        Invoke-WebRequest -Uri $ScriptUrl -OutFile $AGENT_PATH -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-Host "ERROR: Failed to download script from: $ScriptUrl" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        exit 1
     }
-    $Config.TARGETS = $Current.ToArray()
-    $Config | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
-    $ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$($job.id)/ack?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
-    Invoke-WebRequest -Uri $ackUri -Method Post
+} else {
+    Write-Host "ERROR: Cannot place the agent script on disk." -ForegroundColor Red
+    Write-Host "Either save the script as a .ps1 file and run it, or supply -ScriptUrl with the raw GitHub URL." -ForegroundColor Yellow
+    exit 1
 }
-'@
-$pullCode | Out-File $PULL_PATH -Encoding utf8
 
-# --- 6. Task Registration ---
-Write-Host "Registering Scheduled Tasks..." -ForegroundColor Yellow
-$ActionMonitor = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -File `"$AGENT_PATH`""
-$TriggerMonitor = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName "G2_Monitor_Agent" -Action $ActionMonitor -Trigger $TriggerMonitor -User "System" -Force
+# Register Scheduled Tasks (both point to the single copied script)
+Write-Host "`nRegistering Scheduled Tasks..." -ForegroundColor Yellow
 
-$ActionPull = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -File `"$PULL_PATH`""
-$TriggerPull = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
-Register-ScheduledTask -TaskName "G2_Pull_Agent" -Action $ActionPull -Trigger $TriggerPull -User "System" -Force
+$ActionMonitor = New-ScheduledTaskAction `
+    -Execute  "powershell.exe" `
+    -Argument "-WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
 
-Write-Host "`nInstallation Complete!" -ForegroundColor Green
+$TriggerMonitor = New-ScheduledTaskTrigger `
+    -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1)
+
+Register-ScheduledTask `
+    -TaskName $TASK_MONITOR `
+    -Action   $ActionMonitor `
+    -Trigger  $TriggerMonitor `
+    -RunLevel Highest `
+    -User     "SYSTEM" `
+    -Force | Out-Null
+
+$ActionPull = New-ScheduledTaskAction `
+    -Execute  "powershell.exe" `
+    -Argument "-WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
+
+$TriggerPull = New-ScheduledTaskTrigger `
+    -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)
+
+Register-ScheduledTask `
+    -TaskName $TASK_PULL `
+    -Action   $ActionPull `
+    -Trigger  $TriggerPull `
+    -RunLevel Highest `
+    -User     "SYSTEM" `
+    -Force | Out-Null
+
+Write-Host ""
+Write-Host "Installation complete!" -ForegroundColor Green
+Write-Host "  Agent script : $AGENT_PATH"
+Write-Host "  Config file  : $CONFIG_FILE"
+Write-Host "  $TASK_MONITOR  — runs every 1 minute"
+Write-Host "  $TASK_PULL     — runs every 5 minutes"
+Write-Host ""
+Write-Host "Run this script again at any time to uninstall or reconfigure." -ForegroundColor Gray
