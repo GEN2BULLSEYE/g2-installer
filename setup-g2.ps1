@@ -7,7 +7,7 @@
     Scheduled Tasks invoke this same script with -Mode Monitor or -Mode Pull.
 
     To run directly from GitHub (recommended):
-        $u = "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/path/to/installer.ps1"
+        $u = "https://raw.githubusercontent.com/GEN2BULLSEYE/g2-installer/refs/heads/main/setup-g2.ps1"
         & ([scriptblock]::Create((irm $u))) -ScriptUrl $u
 
 .PARAMETER Mode
@@ -133,8 +133,14 @@ if ($Mode -eq "Pull") {
 
     if ($null -eq $jobs -or $jobs.Count -eq 0) { exit 0 }
 
+    # Safely read TARGETS — PS 5.1 ConvertFrom-Json can return {} for an empty []
     $Current = [System.Collections.Generic.List[string]]::new()
-    if ($Config.TARGETS) { $Config.TARGETS | ForEach-Object { $Current.Add($_) } }
+    $rawTargets = $Config.TARGETS
+    if ($rawTargets -is [System.Object[]]) {
+        foreach ($t in $rawTargets) { if ($t -is [string] -and $t.Trim()) { $Current.Add($t) } }
+    } elseif ($rawTargets -is [string] -and $rawTargets.Trim()) {
+        $Current.Add($rawTargets)
+    }
 
     foreach ($job in $jobs) {
         if ($job.action -eq "add") {
@@ -150,8 +156,13 @@ if ($Mode -eq "Pull") {
             }
         }
 
-        $Config.TARGETS = $Current.ToArray()
-        $Config | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+        # Rebuild config as hashtable to ensure TARGETS always serializes as a JSON array (not {} or null)
+        @{
+            ORG_ID      = $Config.ORG_ID
+            LICENSE_KEY = $Config.LICENSE_KEY
+            SERVER_ID   = $Config.SERVER_ID
+            TARGETS     = @($Current.ToArray())
+        } | ConvertTo-Json -Depth 5 | Out-File $CONFIG_FILE -Encoding utf8
 
         try {
             $ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$($job.id)/ack?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
@@ -238,7 +249,7 @@ Write-Host "`nRegistering Scheduled Tasks..." -ForegroundColor Yellow
 
 $ActionMonitor = New-ScheduledTaskAction `
     -Execute  "powershell.exe" `
-    -Argument "-WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
+    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
 
 $TriggerMonitor = New-ScheduledTaskTrigger `
     -Once -At (Get-Date) `
@@ -254,7 +265,7 @@ Register-ScheduledTask `
 
 $ActionPull = New-ScheduledTaskAction `
     -Execute  "powershell.exe" `
-    -Argument "-WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
+    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
 
 $TriggerPull = New-ScheduledTaskTrigger `
     -Once -At (Get-Date) `
