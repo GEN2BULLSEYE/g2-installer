@@ -4,27 +4,41 @@ $CONFIG_FILE = "$INSTALL_DIR\agent.json"
 $AGENT_PATH  = "$INSTALL_DIR\g2agent.ps1"
 $PULL_PATH   = "$INSTALL_DIR\pull-agent.ps1"
 $GEN2_BASE_URL = "https://gen2bullseye.com"
-$FIXED_WEBHOOK_URL = "https://nscl.tailc52c94.ts.net/webhook/ps2"
 
-# --- 2. Existing Installation Detection ---
+# --- 2. Existing Installation Detection & Choice ---
 $TaskMonitor = Get-ScheduledTask -TaskName "G2_Monitor_Agent" -ErrorAction SilentlyContinue
 $TaskPull = Get-ScheduledTask -TaskName "G2_Pull_Agent" -ErrorAction SilentlyContinue
 
 if ($TaskMonitor -or $TaskPull -or (Test-Path $INSTALL_DIR)) {
     Write-Host "--- Existing GEN2 Installation Detected ---" -ForegroundColor Yellow
-    $confirm = Read-Host "An existing installation was found. Would you like to UNINSTALL it first? (y/n)"
+    Write-Host "Choose an option:"
+    Write-Host "y) Uninstall existing version and EXIT (Run again to reinstall)"
+    Write-Host "n) Continue with installation/overwrite without uninstalling"
+    Write-Host "q) Quit"
+    $choice = Read-Host "Selection"
     
-    if ($confirm -eq 'y') {
-        Write-Host "Removing existing tasks and files..." -ForegroundColor Cyan
+    if ($choice -eq 'y') {
+        Write-Host "`nUninstalling GEN2..." -ForegroundColor Cyan
+        # Remove Tasks
         Unregister-ScheduledTask -TaskName "G2_Monitor_Agent" -Confirm:$false -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName "G2_Pull_Agent" -Confirm:$false -ErrorAction SilentlyContinue
+        
+        # Stop background jobs
         Get-Job | Stop-Job -ErrorAction SilentlyContinue
-        if (Test-Path $INSTALL_DIR) { Remove-Item -Recurse -Force $INSTALL_DIR }
-        Write-Host "Cleanup complete.`n" -ForegroundColor Green
+        
+        # Remove Files
+        if (Test-Path $INSTALL_DIR) {
+            Remove-Item -Recurse -Force $INSTALL_DIR
+        }
+        Write-Host "Uninstalled successfully. Exiting script." -ForegroundColor Green
+        exit # This stops the script so the user can start fresh on next run
+    } elseif ($choice -eq 'q') {
+        exit
     }
+    Write-Host "Continuing with setup...`n" -ForegroundColor Gray
 }
 
-# --- 3. Fresh Installation ---
+# --- 3. Fresh Installation (Only reached if no install exists or user chose 'n') ---
 if (!(Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force }
 
 Write-Host "--- GEN2 Windows Ground Probe Setup ---" -ForegroundColor Cyan
@@ -40,7 +54,7 @@ $InitConfig = @{
 }
 $InitConfig | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
 
-# --- 4. Write the Agent Script (Using Literal String) ---
+# --- 4. Write the Agent Script ---
 $agentCode = @'
 $Config = Get-Content "C:\ProgramData\g2serve\agent.json" | ConvertFrom-Json
 $LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike '*Loopback*' }).IPAddress[0]
@@ -76,8 +90,7 @@ foreach ($entry in $Config.TARGETS) {
 '@
 $agentCode | Out-File $AGENT_PATH -Encoding utf8
 
-# --- 5. Write the Pull Agent (Using Literal String) ---
-# We hardcode the base URL here to avoid variable injection issues during setup
+# --- 5. Write the Pull Agent ---
 $pullCode = @'
 $CONFIG_FILE = "C:\ProgramData\g2serve\agent.json"
 $GEN2_BASE_URL = "https://gen2bullseye.com"
