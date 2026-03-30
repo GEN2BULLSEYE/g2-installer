@@ -476,28 +476,17 @@ $btnInstall.Add_Click({
 
         $lblStatus.Text = "Registering Scheduled Tasks..."; $form.Refresh()
 
-        $actMon = New-ScheduledTaskAction `
-            -Execute  "powershell.exe" `
-            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
-        $trigMonRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
-            -RepetitionInterval (New-TimeSpan -Minutes 1) `
-            -RepetitionDuration (New-TimeSpan -Days 9999)
-        $trigMonStartup = New-ScheduledTaskTrigger -AtStartup
-        Register-ScheduledTask -TaskName $TASK_MONITOR -Action $actMon `
-            -Trigger @($trigMonRepeat, $trigMonStartup) `
-            -RunLevel Highest -User "SYSTEM" -Force | Out-Null
+        # Use schtasks.exe directly — avoids PowerShell's XML Duration limit.
+        # /sc MINUTE /mo N creates an indefinitely repeating task with no expiry.
+        $monTr  = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File '$AGENT_PATH' -Mode Monitor"
+        $pullTr = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File '$AGENT_PATH' -Mode Pull"
+
+        $r = & schtasks.exe /create /tn $TASK_MONITOR /tr $monTr /sc MINUTE /mo 1 /ru SYSTEM /rl HIGHEST /f 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Monitor task registration failed: $r" }
         Start-ScheduledTask -TaskName $TASK_MONITOR
 
-        $actPull = New-ScheduledTaskAction `
-            -Execute  "powershell.exe" `
-            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
-        $trigPullRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
-            -RepetitionInterval (New-TimeSpan -Minutes 5) `
-            -RepetitionDuration (New-TimeSpan -Days 9999)
-        $trigPullStartup = New-ScheduledTaskTrigger -AtStartup
-        Register-ScheduledTask -TaskName $TASK_PULL -Action $actPull `
-            -Trigger @($trigPullRepeat, $trigPullStartup) `
-            -RunLevel Highest -User "SYSTEM" -Force | Out-Null
+        $r = & schtasks.exe /create /tn $TASK_PULL /tr $pullTr /sc MINUTE /mo 5 /ru SYSTEM /rl HIGHEST /f 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Pull task registration failed: $r" }
         Start-ScheduledTask -TaskName $TASK_PULL
 
         $lblStatus.ForeColor = $clrAccent
@@ -517,8 +506,8 @@ $btnInstall.Add_Click({
             "GEN2 Ground Probe installed successfully!`n`n" +
             "Agent script : $AGENT_PATH`n" +
             "Config file  : $CONFIG_FILE`n`n" +
-            "$TASK_MONITOR  — runs every 1 minute & on startup`n" +
-            "$TASK_PULL  — runs every 5 minutes & on startup`n`n" +
+            "$TASK_MONITOR  — runs every 1 minute`n" +
+            "$TASK_PULL  — runs every 5 minutes`n`n" +
             "Run this installer again at any time to uninstall or reconfigure.",
             "Installation Complete",
             [System.Windows.Forms.MessageBoxButtons]::OK,
