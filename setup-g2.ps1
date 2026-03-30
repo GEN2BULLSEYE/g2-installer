@@ -138,15 +138,26 @@ if ($Mode -eq "Monitor") {
 # MODE: PULL — runs every 5 minutes via Scheduled Task
 # ============================================================
 if ($Mode -eq "Pull") {
-    if (!(Test-Path $CONFIG_FILE)) { exit 1 }
+    $LOG_FILE = "$INSTALL_DIR\pull.log"
+    function Write-PullLog($msg) {
+        $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
+        Add-Content -Path $LOG_FILE -Value $line -Encoding UTF8
+    }
+
+    if (!(Test-Path $CONFIG_FILE)) { Write-PullLog "ERROR config missing: $CONFIG_FILE"; exit 1 }
     $Config = Get-Content $CONFIG_FILE -Raw | ConvertFrom-Json
 
     try {
         $uri  = "$GEN2_BASE_URL/api/groundprobe/jobs?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
-        $jobs = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
-    } catch { exit 1 }
+        $resp = Invoke-WebRequest -Uri $uri -Method Get -UseBasicParsing -ErrorAction Stop
+        $jobs = $resp.Content | ConvertFrom-Json
+    } catch {
+        Write-PullLog "ERROR fetching jobs — $($_.Exception.Message)"
+        exit 1
+    }
 
     if ($null -eq $jobs -or $jobs.Count -eq 0) { exit 0 }
+    Write-PullLog "INFO  fetched $($jobs.Count) job(s)"
 
     # Safely read TARGETS — PS 5.1 ConvertFrom-Json can return {} for an empty []
     $Current = [System.Collections.Generic.List[string]]::new()
@@ -158,6 +169,8 @@ if ($Mode -eq "Pull") {
     }
 
     foreach ($job in $jobs) {
+        Write-PullLog "INFO  job $($job.id) action=$($job.action) monitor=$($job.monitor_name) target=$($job.target)"
+
         if ($job.action -eq "add") {
             $entry = "$($job.monitor_name) | $($job.target)"
             if (-not ($Current -contains $entry)) { $Current.Add($entry) }
@@ -171,18 +184,22 @@ if ($Mode -eq "Pull") {
             }
         }
 
-        # Rebuild config as hashtable to ensure TARGETS always serializes as a JSON array (not {} or null)
-        @{
+        # Rebuild config — write without BOM so values stay clean on re-read
+        $json = @{
             ORG_ID      = $Config.ORG_ID
             LICENSE_KEY = $Config.LICENSE_KEY
             SERVER_ID   = $Config.SERVER_ID
             TARGETS     = @($Current.ToArray())
-        } | ConvertTo-Json -Depth 5 | Out-File $CONFIG_FILE -Encoding utf8
+        } | ConvertTo-Json -Depth 5
+        [System.IO.File]::WriteAllText($CONFIG_FILE, $json, [System.Text.UTF8Encoding]::new($false))
 
         try {
             $ackUri = "$GEN2_BASE_URL/api/groundprobe/jobs/$($job.id)/ack?license_key=$($Config.LICENSE_KEY)&org_id=$($Config.ORG_ID)"
             Invoke-WebRequest -Uri $ackUri -Method Post -UseBasicParsing | Out-Null
-        } catch { <# non-fatal #> }
+            Write-PullLog "INFO  ack sent for job $($job.id)"
+        } catch {
+            Write-PullLog "WARN  ack failed for job $($job.id) — $($_.Exception.Message)"
+        }
     }
     exit 0
 }
@@ -462,7 +479,9 @@ $btnInstall.Add_Click({
         $actMon = New-ScheduledTaskAction `
             -Execute  "powershell.exe" `
             -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
-        $trigMonRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Minutes 1)
+        $trigMonRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
+            -RepetitionInterval (New-TimeSpan -Minutes 1) `
+            -RepetitionDuration ([System.TimeSpan]::MaxValue)
         $trigMonStartup = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $TASK_MONITOR -Action $actMon `
             -Trigger @($trigMonRepeat, $trigMonStartup) `
@@ -472,7 +491,9 @@ $btnInstall.Add_Click({
         $actPull = New-ScheduledTaskAction `
             -Execute  "powershell.exe" `
             -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
-        $trigPullRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Minutes 5)
+        $trigPullRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
+            -RepetitionInterval (New-TimeSpan -Minutes 5) `
+            -RepetitionDuration ([System.TimeSpan]::MaxValue)
         $trigPullStartup = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $TASK_PULL -Action $actPull `
             -Trigger @($trigPullRepeat, $trigPullStartup) `
