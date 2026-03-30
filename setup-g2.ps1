@@ -188,117 +188,322 @@ if ($Mode -eq "Pull") {
 }
 
 # ============================================================
-# MODE: SETUP — interactive installer (default)
+# MODE: SETUP — WinForms GUI installer (default)
 # ============================================================
 
-# Detect existing installation
+# Load WinForms and Drawing assemblies
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+# Request DPI awareness so the form renders crisply on HiDPI screens
+try {
+    Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public class G2DpiHelper {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+"@
+    [G2DpiHelper]::SetProcessDPIAware() | Out-Null
+} catch {}
+
+# ---- Admin check (dialog instead of console message) ----
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "This installer must be run as Administrator.`n`nRight-click PowerShell and choose 'Run as Administrator', then run the command again.",
+        "Administrator Required",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+    exit 1
+}
+
+# Capture script path now, in outer scope — $MyInvocation is unreliable inside event-handler scriptblocks
+$ScriptSourcePath = $MyInvocation.MyCommand.Path
+
+# ---- Shared theme ----
+$clrBg     = [System.Drawing.Color]::FromArgb(30,  30,  46)
+$clrPanel  = [System.Drawing.Color]::FromArgb(45,  45,  68)
+$clrAccent = [System.Drawing.Color]::FromArgb(0,  212, 170)
+$clrText   = [System.Drawing.Color]::White
+$clrMuted  = [System.Drawing.Color]::FromArgb(160, 160, 190)
+$clrErr    = [System.Drawing.Color]::FromArgb(220,  80,  80)
+$clrInput  = [System.Drawing.Color]::FromArgb(45,  45,  68)
+$fntH1     = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+$fntLabel  = New-Object System.Drawing.Font("Segoe UI",  9)
+$fntInput  = New-Object System.Drawing.Font("Consolas", 10)
+$fntBtn    = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+
+# ---- Existing install dialog ----
 $TaskMonitor = Get-ScheduledTask -TaskName $TASK_MONITOR -ErrorAction SilentlyContinue
 $TaskPull    = Get-ScheduledTask -TaskName $TASK_PULL    -ErrorAction SilentlyContinue
 
 if ($TaskMonitor -or $TaskPull -or (Test-Path $INSTALL_DIR)) {
-    Write-Host ""
-    Write-Host "--- Existing GEN2 Installation Detected ---" -ForegroundColor Yellow
-    Write-Host "Choose an option:"
-    Write-Host "  y) Uninstall and EXIT  (run the script again to reinstall)"
-    Write-Host "  n) Overwrite / reconfigure without uninstalling"
-    Write-Host "  q) Quit"
-    $choice = Read-Host "Selection"
 
-    if ($choice -eq 'y') {
-        Write-Host "`nUninstalling GEN2..." -ForegroundColor Cyan
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "GEN2 Ground Probe"
+    $dlg.Size            = New-Object System.Drawing.Size(440, 210)
+    $dlg.StartPosition   = "CenterScreen"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $clrBg
+    $dlg.ForeColor       = $clrText
+    $dlg.Font            = $fntLabel
+
+    $dlgLbl = New-Object System.Windows.Forms.Label
+    $dlgLbl.Text     = "An existing GEN2 Ground Probe installation was detected.`n`nWhat would you like to do?"
+    $dlgLbl.Location = New-Object System.Drawing.Point(20, 20)
+    $dlgLbl.Size     = New-Object System.Drawing.Size(390, 55)
+    $dlgLbl.ForeColor = $clrText
+    $dlg.Controls.Add($dlgLbl)
+
+    $btnUninstall = New-Object System.Windows.Forms.Button
+    $btnUninstall.Text         = "Uninstall"
+    $btnUninstall.Location     = New-Object System.Drawing.Point(20, 108)
+    $btnUninstall.Size         = New-Object System.Drawing.Size(118, 36)
+    $btnUninstall.BackColor    = $clrErr
+    $btnUninstall.ForeColor    = $clrText
+    $btnUninstall.FlatStyle    = "Flat"
+    $btnUninstall.DialogResult = [System.Windows.Forms.DialogResult]::No
+    $dlg.Controls.Add($btnUninstall)
+
+    $btnReconfig = New-Object System.Windows.Forms.Button
+    $btnReconfig.Text         = "Reconfigure"
+    $btnReconfig.Location     = New-Object System.Drawing.Point(153, 108)
+    $btnReconfig.Size         = New-Object System.Drawing.Size(118, 36)
+    $btnReconfig.BackColor    = $clrAccent
+    $btnReconfig.ForeColor    = $clrBg
+    $btnReconfig.FlatStyle    = "Flat"
+    $btnReconfig.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+    $dlg.Controls.Add($btnReconfig)
+
+    $btnDlgCancel = New-Object System.Windows.Forms.Button
+    $btnDlgCancel.Text         = "Cancel"
+    $btnDlgCancel.Location     = New-Object System.Drawing.Point(286, 108)
+    $btnDlgCancel.Size         = New-Object System.Drawing.Size(118, 36)
+    $btnDlgCancel.BackColor    = $clrPanel
+    $btnDlgCancel.ForeColor    = $clrText
+    $btnDlgCancel.FlatStyle    = "Flat"
+    $btnDlgCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnDlgCancel)
+
+    $dlg.AcceptButton = $btnReconfig
+    $dlg.CancelButton = $btnDlgCancel
+    # Closing via X is treated as Cancel (same as pressing the Cancel button)
+    $dlg.Add_FormClosing({
+        if ($dlg.DialogResult -eq [System.Windows.Forms.DialogResult]::None) {
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        }
+    })
+
+    $dlgResult = $dlg.ShowDialog()
+    $dlg.Dispose()
+
+    if ($dlgResult -eq [System.Windows.Forms.DialogResult]::No) {
         Unregister-ScheduledTask -TaskName $TASK_MONITOR -Confirm:$false -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $TASK_PULL    -Confirm:$false -ErrorAction SilentlyContinue
         if (Test-Path $INSTALL_DIR) { Remove-Item -Recurse -Force $INSTALL_DIR }
-        Write-Host "Uninstalled successfully. Run the script again to reinstall." -ForegroundColor Green
+        [System.Windows.Forms.MessageBox]::Show(
+            "GEN2 Ground Probe has been uninstalled.`n`nRun the installer again to reinstall.",
+            "Uninstalled",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
         exit 0
-    } elseif ($choice -eq 'q') {
+    } elseif ($dlgResult -eq [System.Windows.Forms.DialogResult]::Cancel) {
         exit 0
     }
-    Write-Host "Continuing with setup...`n" -ForegroundColor Gray
+    # Yes = Reconfigure — fall through to main form
 }
 
-# Create install directory
-if (!(Test-Path $INSTALL_DIR)) {
-    New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null
+# ---- Main installer form ----
+$form = New-Object System.Windows.Forms.Form
+$form.Text            = "GEN2 Ground Probe Installer"
+$form.Size            = New-Object System.Drawing.Size(480, 420)
+$form.StartPosition   = "CenterScreen"
+$form.FormBorderStyle = "FixedSingle"
+$form.MaximizeBox     = $false
+$form.BackColor       = $clrBg
+$form.ForeColor       = $clrText
+$form.Font            = $fntLabel
+
+# Header bar
+$header           = New-Object System.Windows.Forms.Panel
+$header.Size      = New-Object System.Drawing.Size(480, 72)
+$header.Location  = New-Object System.Drawing.Point(0, 0)
+$header.BackColor = $clrPanel
+$form.Controls.Add($header)
+
+$lblTitle          = New-Object System.Windows.Forms.Label
+$lblTitle.Text     = "GEN2 Ground Probe"
+$lblTitle.Font     = $fntH1
+$lblTitle.ForeColor = $clrAccent
+$lblTitle.Location = New-Object System.Drawing.Point(20, 12)
+$lblTitle.Size     = New-Object System.Drawing.Size(380, 32)
+$header.Controls.Add($lblTitle)
+
+$lblSub           = New-Object System.Windows.Forms.Label
+$lblSub.Text      = "Windows Agent Installer"
+$lblSub.ForeColor = $clrMuted
+$lblSub.Location  = New-Object System.Drawing.Point(22, 46)
+$lblSub.Size      = New-Object System.Drawing.Size(220, 18)
+$header.Controls.Add($lblSub)
+
+# Helper — adds a muted label + styled TextBox, returns the TextBox
+function Add-Field {
+    param($labelText, $defaultValue, $yPos)
+    $lbl           = New-Object System.Windows.Forms.Label
+    $lbl.Text      = $labelText
+    $lbl.Location  = New-Object System.Drawing.Point(30, $yPos)
+    $lbl.Size      = New-Object System.Drawing.Size(410, 18)
+    $lbl.ForeColor = $clrMuted
+    $form.Controls.Add($lbl)
+
+    $txt              = New-Object System.Windows.Forms.TextBox
+    $txt.Text         = $defaultValue
+    $txt.Location     = New-Object System.Drawing.Point(30, ($yPos + 20))
+    $txt.Size         = New-Object System.Drawing.Size(410, 28)
+    $txt.BackColor    = $clrInput
+    $txt.ForeColor    = $clrText
+    $txt.BorderStyle  = "FixedSingle"
+    $txt.Font         = $fntInput
+    $form.Controls.Add($txt)
+    return $txt
 }
 
-# Collect credentials
-Write-Host ""
-Write-Host "--- GEN2 Windows Ground Probe Setup ---" -ForegroundColor Cyan
-$OrgId    = Read-Host "Organization ID"
-$License  = Read-Host "License Key"
-$ServerId = Read-Host "Server ID (friendly name for this machine)"
+$txtOrg     = Add-Field "Organization ID"              ""                 92
+$txtLicense = Add-Field "License Key"                  ""                 148
+$txtServer  = Add-Field "Server ID (friendly name)"    $env:COMPUTERNAME  204
 
-# Write config
-@{
-    ORG_ID      = $OrgId
-    LICENSE_KEY = $License
-    SERVER_ID   = $ServerId
-    TARGETS     = @()
-} | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+# Status label
+$lblStatus           = New-Object System.Windows.Forms.Label
+$lblStatus.Text      = ""
+$lblStatus.Location  = New-Object System.Drawing.Point(30, 274)
+$lblStatus.Size      = New-Object System.Drawing.Size(410, 20)
+$lblStatus.ForeColor = $clrMuted
+$form.Controls.Add($lblStatus)
 
-# Copy / download this script to the install directory so Scheduled Tasks can reference it
-$ScriptSource = $MyInvocation.MyCommand.Path
+# Install button
+$btnInstall           = New-Object System.Windows.Forms.Button
+$btnInstall.Text      = "Install"
+$btnInstall.Location  = New-Object System.Drawing.Point(30, 302)
+$btnInstall.Size      = New-Object System.Drawing.Size(410, 46)
+$btnInstall.BackColor = $clrAccent
+$btnInstall.ForeColor = $clrBg
+$btnInstall.FlatStyle = "Flat"
+$btnInstall.Font      = $fntBtn
+$form.Controls.Add($btnInstall)
 
-if (-not [string]::IsNullOrEmpty($ScriptSource)) {
-    # Running from a saved file — just copy it
-    Copy-Item -Path $ScriptSource -Destination $AGENT_PATH -Force
-} elseif (-not [string]::IsNullOrEmpty($ScriptUrl)) {
-    # Running from memory (irm | iex / scriptblock) — download from GitHub
-    Write-Host "Downloading agent script from GitHub..." -ForegroundColor Cyan
+# ---- Install logic ----
+$btnInstall.Add_Click({
+    $OrgId    = $txtOrg.Text.Trim()
+    $License  = $txtLicense.Text.Trim()
+    $ServerId = $txtServer.Text.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($OrgId) -or
+        [string]::IsNullOrWhiteSpace($License) -or
+        [string]::IsNullOrWhiteSpace($ServerId)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Please fill in all three fields before installing.",
+            "Required Fields",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+
+    # Lock UI during install
+    $txtOrg.Enabled     = $false
+    $txtLicense.Enabled = $false
+    $txtServer.Enabled  = $false
+    $btnInstall.Enabled = $false
+    $btnInstall.Text    = "Installing..."
+    $lblStatus.ForeColor = $clrMuted
+
+    $installOk = $true
+    $installErr = ""
+
     try {
-        Invoke-WebRequest -Uri $ScriptUrl -OutFile $AGENT_PATH -UseBasicParsing -ErrorAction Stop
+        $lblStatus.Text = "Creating install directory..."; $form.Refresh()
+        if (!(Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null }
+
+        $lblStatus.Text = "Writing configuration..."; $form.Refresh()
+        @{
+            ORG_ID      = $OrgId
+            LICENSE_KEY = $License
+            SERVER_ID   = $ServerId
+            TARGETS     = @()
+        } | ConvertTo-Json | Out-File $CONFIG_FILE -Encoding utf8
+
+        if (-not [string]::IsNullOrEmpty($ScriptSourcePath)) {
+            $lblStatus.Text = "Copying agent script..."; $form.Refresh()
+            Copy-Item -Path $ScriptSourcePath -Destination $AGENT_PATH -Force
+        } elseif (-not [string]::IsNullOrEmpty($ScriptUrl)) {
+            $lblStatus.Text = "Downloading agent script from GitHub..."; $form.Refresh()
+            Invoke-WebRequest -Uri $ScriptUrl -OutFile $AGENT_PATH -UseBasicParsing -ErrorAction Stop
+        } else {
+            throw "Cannot place agent script on disk. Run with -ScriptUrl pointing to the raw GitHub URL."
+        }
+
+        $lblStatus.Text = "Registering Scheduled Tasks..."; $form.Refresh()
+
+        $actMon = New-ScheduledTaskAction `
+            -Execute  "powershell.exe" `
+            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
+        $trigMon = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName $TASK_MONITOR -Action $actMon -Trigger $trigMon `
+            -RunLevel Highest -User "SYSTEM" -Force | Out-Null
+
+        $actPull = New-ScheduledTaskAction `
+            -Execute  "powershell.exe" `
+            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
+        $trigPull = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+        Register-ScheduledTask -TaskName $TASK_PULL -Action $actPull -Trigger $trigPull `
+            -RunLevel Highest -User "SYSTEM" -Force | Out-Null
+
+        $lblStatus.ForeColor = $clrAccent
+        $lblStatus.Text      = "Installation complete!"
+        $form.Refresh()
+
     } catch {
-        Write-Host "ERROR: Failed to download script from: $ScriptUrl" -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        exit 1
+        $installOk  = $false
+        $installErr = $_.Exception.Message
+        $lblStatus.ForeColor = $clrErr
+        $lblStatus.Text      = "Error — see dialog for details"
+        $form.Refresh()
     }
-} else {
-    Write-Host "ERROR: Cannot place the agent script on disk." -ForegroundColor Red
-    Write-Host "Either save the script as a .ps1 file and run it, or supply -ScriptUrl with the raw GitHub URL." -ForegroundColor Yellow
-    exit 1
-}
 
-# Register Scheduled Tasks (both point to the single copied script)
-Write-Host "`nRegistering Scheduled Tasks..." -ForegroundColor Yellow
+    if ($installOk) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "GEN2 Ground Probe installed successfully!`n`n" +
+            "Agent script : $AGENT_PATH`n" +
+            "Config file  : $CONFIG_FILE`n`n" +
+            "$TASK_MONITOR  — runs every 1 minute`n" +
+            "$TASK_PULL  — runs every 5 minutes`n`n" +
+            "Run this installer again at any time to uninstall or reconfigure.",
+            "Installation Complete",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        $form.Close()
+    } else {
+        # Unlock UI so user can correct inputs and retry
+        $txtOrg.Enabled     = $true
+        $txtLicense.Enabled = $true
+        $txtServer.Enabled  = $true
+        $btnInstall.Enabled = $true
+        $btnInstall.Text    = "Install"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Installation failed:`n`n$installErr",
+            "Installation Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    }
+})
 
-$ActionMonitor = New-ScheduledTaskAction `
-    -Execute  "powershell.exe" `
-    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
-
-$TriggerMonitor = New-ScheduledTaskTrigger `
-    -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 1)
-
-Register-ScheduledTask `
-    -TaskName $TASK_MONITOR `
-    -Action   $ActionMonitor `
-    -Trigger  $TriggerMonitor `
-    -RunLevel Highest `
-    -User     "SYSTEM" `
-    -Force | Out-Null
-
-$ActionPull = New-ScheduledTaskAction `
-    -Execute  "powershell.exe" `
-    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
-
-$TriggerPull = New-ScheduledTaskTrigger `
-    -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)
-
-Register-ScheduledTask `
-    -TaskName $TASK_PULL `
-    -Action   $ActionPull `
-    -Trigger  $TriggerPull `
-    -RunLevel Highest `
-    -User     "SYSTEM" `
-    -Force | Out-Null
-
-Write-Host ""
-Write-Host "Installation complete!" -ForegroundColor Green
-Write-Host "  Agent script : $AGENT_PATH"
-Write-Host "  Config file  : $CONFIG_FILE"
-Write-Host "  $TASK_MONITOR  — runs every 1 minute"
-Write-Host "  $TASK_PULL     — runs every 5 minutes"
-Write-Host ""
-Write-Host "Run this script again at any time to uninstall or reconfigure." -ForegroundColor Gray
+[void]$form.ShowDialog()
+$form.Dispose()
