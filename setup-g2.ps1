@@ -10,7 +10,7 @@
         $u = "https://raw.githubusercontent.com/GEN2BULLSEYE/g2-installer/refs/heads/main/setup-g2.ps1"
         & ([scriptblock]::Create((irm $u))) -ScriptUrl $u
 
-.PARAMETER Mode
+.PARAMETER Modedup
     Setup   — (default) Installs, uninstalls, or reconfigures the agent.
     Monitor — Runs one monitoring pass (called every minute by Scheduled Task).
     Pull    — Runs one job-pull pass (called every 5 minutes by Scheduled Task).
@@ -195,7 +195,7 @@ if ($Mode -eq "Pull") {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
-[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch {}
 
 # Request DPI awareness so the form renders crisply on HiDPI screens
 try {
@@ -226,7 +226,7 @@ $ScriptSourcePath = $MyInvocation.MyCommand.Path
 # ---- Shared theme ----
 $clrBg     = [System.Drawing.Color]::FromArgb(30,  30,  46)
 $clrPanel  = [System.Drawing.Color]::FromArgb(45,  45,  68)
-$clrAccent = [System.Drawing.Color]::FromArgb(0,  212, 170)
+$clrAccent = [System.Drawing.Color]::FromArgb(74, 144, 226)
 $clrText   = [System.Drawing.Color]::White
 $clrMuted  = [System.Drawing.Color]::FromArgb(160, 160, 190)
 $clrErr    = [System.Drawing.Color]::FromArgb(220,  80,  80)
@@ -353,20 +353,12 @@ $picLogo.Size      = New-Object System.Drawing.Size(148, 48)
 $picLogo.BackColor = $clrPanel
 $header.Controls.Add($picLogo)
 
-# Title + subtitle to the right of the logo
-$lblTitle           = New-Object System.Windows.Forms.Label
-$lblTitle.Text      = "GEN2 Ground Probe"
-$lblTitle.Font      = $fntH1
-$lblTitle.ForeColor = $clrAccent
-$lblTitle.Location  = New-Object System.Drawing.Point(174, 12)
-$lblTitle.Size      = New-Object System.Drawing.Size(285, 32)
-$header.Controls.Add($lblTitle)
-
+# Subtitle sits directly below the logo, left-aligned with it
 $lblSub           = New-Object System.Windows.Forms.Label
 $lblSub.Text      = "Windows Agent Installer"
 $lblSub.ForeColor = $clrMuted
-$lblSub.Location  = New-Object System.Drawing.Point(176, 48)
-$lblSub.Size      = New-Object System.Drawing.Size(280, 18)
+$lblSub.Location  = New-Object System.Drawing.Point(16, 64)
+$lblSub.Size      = New-Object System.Drawing.Size(300, 18)
 $header.Controls.Add($lblSub)
 
 # Helper — adds a muted label + styled TextBox, returns the TextBox
