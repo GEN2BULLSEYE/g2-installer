@@ -481,7 +481,7 @@ $btnInstall.Add_Click({
             -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Monitor"
         $trigMonRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
             -RepetitionInterval (New-TimeSpan -Minutes 1) `
-            -RepetitionDuration ([System.TimeSpan]::MaxValue)
+            -RepetitionDuration (New-TimeSpan -Days 9999)
         $trigMonStartup = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $TASK_MONITOR -Action $actMon `
             -Trigger @($trigMonRepeat, $trigMonStartup) `
@@ -493,7 +493,7 @@ $btnInstall.Add_Click({
             -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$AGENT_PATH`" -Mode Pull"
         $trigPullRepeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) `
             -RepetitionInterval (New-TimeSpan -Minutes 5) `
-            -RepetitionDuration ([System.TimeSpan]::MaxValue)
+            -RepetitionDuration (New-TimeSpan -Days 9999)
         $trigPullStartup = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $TASK_PULL -Action $actPull `
             -Trigger @($trigPullRepeat, $trigPullStartup) `
