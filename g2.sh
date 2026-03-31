@@ -120,7 +120,7 @@ install_pull_agent() {
   fi
 }
 
-# Dispatch a job to GEN2 via device-facing API (no admin session required)
+# Dispatch a job to GEN2 via device-facing API
 dispatch_remote_job() {
   local action="$1" name="$2" target="$3"
   RESP=$(curl -s -w "\n%{http_code}" -X POST \
@@ -137,8 +137,6 @@ dispatch_remote_job() {
   fi
 }
 
-# View remote jobs (non-mutating — does NOT mark jobs as delivered)
-# Shows pending/delivered jobs first, then completed
 view_remote_jobs() {
   echo ""
   echo "Fetching pending jobs from GEN2..."
@@ -158,12 +156,10 @@ view_remote_jobs() {
     return
   fi
 
-  # Show pending/delivered first
   PENDING_COUNT=$(echo "$BODY" | jq '[.[] | select(.status == "pending" or .status == "delivered")] | length')
   COMPLETED_COUNT=$(echo "$BODY" | jq '[.[] | select(.status == "completed")] | length')
 
   echo "--- Remote Jobs: $PENDING_COUNT pending/in-progress, $COMPLETED_COUNT completed ---"
-  # Pending/delivered first
   for i in $(seq 0 $((COUNT - 1))); do
     STATUS=$(echo "$BODY" | jq -r ".[$i].status")
     [[ "$STATUS" == "completed" ]] && continue
@@ -205,11 +201,6 @@ if [ -f "$CONFIG_FILE" ]; then
         echo "2) Remove Monitor (via GEN2 remote job)"
         echo "3) View Remote Job Status"
         echo "4) Back"
-        if [[ "$PULL_ACTIVE" != "yes" ]]; then
-          echo ""
-          echo "  [!] Pull agent not found — jobs will queue in GEN2 but won't be applied"
-          echo "      until pull-agent.sh is installed. Re-run the installer to enable it."
-        fi
         read -p "Selection: " m_opt
         if [[ "$m_opt" == "1" ]]; then
           read -p "  Monitor Name: " m_name
@@ -256,14 +247,13 @@ else
   save_config
   write_agent_script
 
-  # Register monitoring cron (every minute)
-  (crontab -l 2>/dev/null | grep -v "g2agent.sh"; echo "* * * * * $AGENT_PATH > /dev/null 2>&1") | crontab -
+  # Register monitoring cron (CHANGED: every 5 minutes)
+  (crontab -l 2>/dev/null | grep -v "g2agent.sh"; echo "*/5 * * * * $AGENT_PATH > /dev/null 2>&1") | crontab -
 
   # Always install pull agent for remote management
   install_pull_agent
 
   echo ""
   echo "Installation Complete!"
-  echo "Your probe is connected. Dispatch monitors remotely from:"
-  echo "  ${GEN2_API_BASE_URL} → Ground Probe Onboarding → Dispatch"
+  echo "Your probe is connected. Monitors will run and sync every 5 minutes."
 fi
