@@ -432,3 +432,346 @@ install_systemd_units() {
   local interval="$1"
 
   need_root_linux
+  cat > "/etc/systemd/system/$SYSTEMD_AGENT_SERVICE" <<EOF
+[Unit]
+Description=GEN2 Ground Probe Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$AGENT_PATH
+EOF
+
+  cat > "/etc/systemd/system/$SYSTEMD_AGENT_TIMER" <<EOF
+[Unit]
+Description=Run GEN2 Agent every ${interval}s
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${interval}s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "/etc/systemd/system/$SYSTEMD_PULL_SERVICE" <<EOF
+[Unit]
+Description=GEN2 Pull Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$PULL_AGENT_PATH
+EOF
+
+  cat > "/etc/systemd/system/$SYSTEMD_PULL_TIMER" <<EOF
+[Unit]
+Description=Run GEN2 Pull Agent every ${DEFAULT_PULL_INTERVAL_SECONDS}s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${DEFAULT_PULL_INTERVAL_SECONDS}s
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "$SYSTEMD_AGENT_TIMER" "$SYSTEMD_PULL_TIMER"
+}
+
+remove_systemd_units() {
+  need_root_linux
+  systemctl disable --now "$SYSTEMD_AGENT_TIMER" "$SYSTEMD_PULL_TIMER" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SYSTEMD_AGENT_SERVICE" "/etc/systemd/system/$SYSTEMD_AGENT_TIMER" \
+        "/etc/systemd/system/$SYSTEMD_PULL_SERVICE" "/etc/systemd/system/$SYSTEMD_PULL_TIMER"
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+install_launchd_units() {
+  local interval="$1"
+
+  safe_mkdir "$LAUNCHD_DIR"
+
+  cat > "$LAUNCHD_AGENT_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gen2.g2agent</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$AGENT_PATH</string></array>
+  <key>StartInterval</key><integer>$interval</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/g2agent.out</string>
+  <key>StandardErrorPath</key><string>/tmp/g2agent.err</string>
+</dict></plist>
+EOF
+
+  cat > "$LAUNCHD_PULL_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.gen2.g2pull</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$PULL_AGENT_PATH</string></array>
+  <key>StartInterval</key><integer>$DEFAULT_PULL_INTERVAL_SECONDS</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/g2pull.out</string>
+  <key>StandardErrorPath</key><string>/tmp/g2pull.err</string>
+</dict></plist>
+EOF
+
+  chown "$REAL_USER" "$LAUNCHD_AGENT_PATH" "$LAUNCHD_PULL_PATH" 2>/dev/null || true
+
+  # Load in the user's GUI session
+  sudo -u "$REAL_USER" launchctl bootout "gui/$REAL_UID" "$LAUNCHD_AGENT_PATH" 2>/dev/null || true
+  sudo -u "$REAL_USER" launchctl bootout "gui/$REAL_UID" "$LAUNCHD_PULL_PATH" 2>/dev/null || true
+  sudo -u "$REAL_USER" launchctl bootstrap "gui/$REAL_UID" "$LAUNCHD_AGENT_PATH"
+  sudo -u "$REAL_USER" launchctl bootstrap "gui/$REAL_UID" "$LAUNCHD_PULL_PATH"
+}
+
+remove_launchd_units() {
+  sudo -u "$REAL_USER" launchctl bootout "gui/$REAL_UID" "$LAUNCHD_AGENT_PATH" 2>/dev/null || true
+  sudo -u "$REAL_USER" launchctl bootout "gui/$REAL_UID" "$LAUNCHD_PULL_PATH" 2>/dev/null || true
+  rm -f "$LAUNCHD_AGENT_PATH" "$LAUNCHD_PULL_PATH"
+}
+
+install_cron_fallback_linux() {
+  need_root_linux
+  (crontab -l 2>/dev/null | grep -v "$AGENT_PATH" | grep -v "$PULL_AGENT_PATH" || true
+   echo "*/2 * * * * $AGENT_PATH >/dev/null 2>&1"
+   echo "*/5 * * * * $PULL_AGENT_PATH >/dev/null 2>&1"
+  ) | crontab -
+}
+
+remove_cron_linux() {
+  need_root_linux
+  (crontab -l 2>/dev/null | grep -v "$AGENT_PATH" | grep -v "$PULL_AGENT_PATH" || true) | crontab - 2>/dev/null || true
+}
+
+install_scheduler() {
+  load_config
+  local interval="${MONITOR_INTERVAL:-$DEFAULT_MONITOR_INTERVAL_SECONDS}"
+
+  if [[ "$OS" == "linux" ]]; then
+    if is_systemd; then
+      install_systemd_units "$interval"
+    else
+      warn "systemd not detected; using cron fallback."
+      install_cron_fallback_linux
+    fi
+  else
+    install_launchd_units "$interval"
+  fi
+}
+
+remove_scheduler() {
+  if [[ "$OS" == "linux" ]]; then
+    if is_systemd; then
+      remove_systemd_units
+    fi
+    remove_cron_linux
+  else
+    remove_launchd_units
+  fi
+}
+
+# ---------- Actions ----------
+fresh_install() {
+  log "Fresh installation..."
+  install_deps
+  ensure_dirs
+
+  read -rp "Org ID: " org
+  read -rp "License Key: " lic
+  read -rp "Server ID: " sid
+
+  local webhook="$DEFAULT_WEBHOOK"
+  read -rp "N8N Webhook URL [default: $DEFAULT_WEBHOOK]: " wh
+  [[ -n "${wh:-}" ]] && webhook="$wh"
+
+  interval="$(prompt_interval)"
+
+  # Concurrency tuning (Pi-safe default)
+  read -rp "Max parallel checks [default ${DEFAULT_MAX_JOBS}]: " mj
+  mj="${mj:-$DEFAULT_MAX_JOBS}"
+
+  log "Configure monitors:"
+  mapfile -t mons < <(prompt_monitors)
+
+  write_config "$org" "$lic" "$sid" "$webhook" "$interval" "$mj" "${mons[@]}"
+
+  write_agent
+  install_pull_agent
+  install_scheduler
+
+  log "Installed OK."
+  log "Monitor frequency: ${interval}s, pull: ${DEFAULT_PULL_INTERVAL_SECONDS}s, max_jobs: $mj"
+}
+
+configure_monitors_and_timers() {
+  load_config
+
+  log "Reconfigure monitors & timer"
+  interval="$(prompt_interval)"
+  read -rp "Max parallel checks [current ${MAX_JOBS:-$DEFAULT_MAX_JOBS}]: " mj
+  mj="${mj:-${MAX_JOBS:-$DEFAULT_MAX_JOBS}}"
+
+  log "Configure monitors:"
+  mapfile -t mons < <(prompt_monitors)
+
+  write_config "$ORG_ID" "$LICENSE_KEY" "$SERVER_ID" "$N8N_WEBHOOK_URL" "$interval" "$mj" "${mons[@]}"
+
+  write_agent
+  install_scheduler
+
+  log "Updated monitors/timers OK."
+}
+
+repair_or_reconfigure() {
+  log "Repair / reconfigure..."
+  install_deps
+  ensure_dirs
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    warn "Config missing. Running fresh install..."
+    fresh_install
+    return
+  fi
+
+  load_config
+  write_agent
+  install_pull_agent
+  install_scheduler
+
+  log "Repair complete."
+}
+
+uninstall_completely() {
+  log "Uninstalling..."
+  remove_scheduler
+  rm -rf "$INSTALL_DIR"
+  rm -rf "$QUEUE_DIR_DEFAULT"
+  log "Uninstalled completely."
+}
+
+status() {
+  echo ""
+  log "OS: $OS"
+  log "Install dir: $INSTALL_DIR"
+  log "Config: $CONFIG_FILE"
+  log "Agent: $AGENT_PATH"
+  log "Pull agent: $PULL_AGENT_PATH"
+  echo ""
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    log "Org ID: ${ORG_ID:-N/A}"
+    log "License: $(mask_secret "${LICENSE_KEY:-}")"
+    log "Server ID: ${SERVER_ID:-N/A}"
+    log "Webhook: ${N8N_WEBHOOK_URL:-N/A}"
+    log "Monitor interval: ${MONITOR_INTERVAL:-$DEFAULT_MONITOR_INTERVAL_SECONDS}s"
+    log "Max jobs: ${MAX_JOBS:-$DEFAULT_MAX_JOBS}"
+    echo ""
+  else
+    warn "No config found."
+  fi
+
+  if [[ "$OS" == "linux" && $(is_systemd && echo yes || echo no) == "yes" ]]; then
+    systemctl list-timers --all | grep -E 'g2agent|g2pull' || true
+  elif [[ "$OS" == "macos" ]]; then
+    sudo -u "$REAL_USER" launchctl print "gui/$REAL_UID/com.gen2.g2agent" 2>/dev/null | head -n 25 || true
+    sudo -u "$REAL_USER" launchctl print "gui/$REAL_UID/com.gen2.g2pull" 2>/dev/null | head -n 25 || true
+  fi
+
+  echo ""
+  if [[ -f "$QUEUE_DIR_DEFAULT/queue.jsonl" ]]; then
+    log "Queue lines: $(wc -l < "$QUEUE_DIR_DEFAULT/queue.jsonl" 2>/dev/null || echo 0)"
+  else
+    log "Queue: empty/not present"
+  fi
+}
+
+run_once() {
+  [[ -x "$AGENT_PATH" ]] || die "Agent missing. Run: $0 repair"
+  "$AGENT_PATH"
+  log "Run-once completed."
+}
+
+menu_existing_install() {
+  echo ""
+  log "Existing GEN2 installation detected at $INSTALL_DIR"
+  echo "1) Configure monitors & timers"
+  echo "2) Uninstall completely"
+  echo "3) Repair / reconfigure"
+  echo "4) Status"
+  echo "5) Exit"
+  read -rp "Select [1-5]: " choice
+  case "$choice" in
+    1) configure_monitors_and_timers ;;
+    2) uninstall_completely ;;
+    3) repair_or_reconfigure ;;
+    4) status ;;
+    *) exit 0 ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  bash $0 install
+  bash $0 configure
+  bash $0 repair
+  bash $0 uninstall
+  bash $0 status
+  bash $0 run-once
+
+Notes:
+- Linux install/repair/uninstall typically requires sudo.
+- macOS install should be run without sudo (preferred), but works with sudo too.
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    install)
+      if is_installed; then menu_existing_install; else fresh_install; fi
+      ;;
+    configure)
+      if is_installed; then configure_monitors_and_timers; else die "Not installed yet. Run: install"; fi
+      ;;
+    repair)
+      repair_or_reconfigure
+      ;;
+    uninstall)
+      uninstall_completely
+      ;;
+    status)
+      status
+      ;;
+    run-once)
+      run_once
+      ;;
+    "" )
+      # No command: auto behavior
+      if is_installed; then menu_existing_install; else fresh_install; fi
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
