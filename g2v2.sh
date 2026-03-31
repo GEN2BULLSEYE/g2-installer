@@ -96,3 +96,111 @@ for entry in "${TARGETS[@]}"; do
   LOCAL_IP="$(hostname -I | awk '{print $1}')"
   WAN_IP="$(get_wan)"
 
+  ping -c 1 -W 2 "$TARGET" >/dev/null && PING_STATUS="up" || PING_STATUS="down"
+
+  HTTP_STATUS="n/a"
+  HTTP_LATENCY=0
+  if [[ "$TARGET" =~ ^https?:// ]]; then
+    t=$(curl -o /dev/null -s -w '%{time_total}' --connect-timeout 3 --max-time 6 "$TARGET" || true)
+    if [[ -n "$t" ]]; then
+      HTTP_STATUS="up"
+      HTTP_LATENCY=$(awk "BEGIN{print $t*1000}")
+    fi
+  fi
+
+  PAYLOAD=$(jq -n \
+    --arg oid "$ORG_ID" \
+    --arg lic "$LICENSE_KEY" \
+    --arg sid "$SERVER_ID" \
+    --arg mon "$NAME" \
+    --arg tar "$TARGET" \
+    --arg lip "$LOCAL_IP" \
+    --arg wan "$WAN_IP" \
+    --arg ps "$PING_STATUS" \
+    --arg hs "$HTTP_STATUS" \
+    --argjson hl "$HTTP_LATENCY" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{org_id:$oid,license_key:$lic,server_id:$sid,monitor:$mon,target:$tar,local_ip:$lip,wan_ip:$wan,ping_status:$ps,http_status:$hs,http_latency_ms:$hl,timestamp:$ts}'
+  )
+
+  post "$PAYLOAD" || echo "$PAYLOAD" >>"$QUEUE_FILE"
+)&
+done
+wait
+
+flush_queue
+EOF
+
+  chmod +x "$AGENT"
+}
+
+# -------------------------
+# systemd timers (2 min)
+# -------------------------
+install_systemd() {
+  cat > /etc/systemd/system/g2agent.service <<EOF
+[Service]
+Type=oneshot
+ExecStart=$AGENT
+EOF
+
+  cat > /etc/systemd/system/g2agent.timer <<EOF
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${MONITOR_INTERVAL_SECONDS}s
+Persistent=true
+EOF
+
+  cat > /etc/systemd/system/g2pull.service <<EOF
+[Service]
+Type=oneshot
+ExecStart=$PULL_AGENT
+EOF
+
+  cat > /etc/systemd/system/g2pull.timer <<EOF
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=${PULL_INTERVAL_SECONDS}s
+Persistent=true
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now g2agent.timer g2pull.timer
+}
+
+# -------------------------
+# Install
+# -------------------------
+install() {
+  install_deps
+  mkdir -p "$INSTALL_DIR"
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    read -rp "Org ID: " ORG_ID
+    read -rp "License Key: " LICENSE_KEY
+    read -rp "Server ID: " SERVER_ID
+
+    {
+      echo "ORG_ID=\"$ORG_ID\""
+      echo "LICENSE_KEY=\"$LICENSE_KEY\""
+      echo "SERVER_ID=\"$SERVER_ID\""
+      echo "N8N_WEBHOOK_URL=\"$N8N_WEBHOOK_URL_DEFAULT\""
+      echo "declare -a TARGETS=()"
+    } > "$CONFIG_FILE"
+  fi
+
+  write_agent
+  curl -fsSL "$PULL_AGENT_URL" -o "$PULL_AGENT"
+  chmod +x "$PULL_AGENT"
+
+  install_systemd
+  log "Installed. Monitoring every 2 minutes."
+}
+
+case "${1:-install}" in
+  install) install ;;
+  repair) install ;;
+  uninstall) systemctl disable --now g2agent.timer g2pull.timer; rm -rf "$INSTALL_DIR" "$QUEUE_DIR" ;;
+  run-once) bash "$AGENT" ;;
+  *) echo "Usage: install|repair|uninstall|run-once" ;;
+esac
